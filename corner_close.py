@@ -168,16 +168,30 @@ class CornerCloseRepair:
     # ── 自由边 / 几何离散工具 ──
 
     def _edge_points(self, ext, eid: int, n: int = 12):
-        """把边离散为 3D 折线点列（用于测距）。"""
+        """把边离散为 3D 折线点列（用于测距）。
+
+        P8：离散结果按 (extractor, eid, n) 全局缓存——原实现在每个
+        面组合内重复离散化同一条边（O(面组合数) 次 BRepAdaptor_Curve）。
+        """
+        cache = getattr(self, '_pts_cache', None)
+        if cache is None:
+            cache = {}
+            self._pts_cache = cache
+        ck = (id(ext), eid, n)
+        hit = cache.get(ck)
+        if hit is not None:
+            return hit
         edge = ext._edge_shapes[eid]
         try:
             ad = BRepAdaptor_Curve(edge)
         except Exception:
+            cache[ck] = []
             return []
         first = ad.FirstParameter()
         last = ad.LastParameter()
         pts = []
         if not (math.isfinite(first) and math.isfinite(last)) or last <= first:
+            cache[ck] = []
             return []
         for i in range(n + 1):
             p = gp_Pnt()
@@ -186,7 +200,36 @@ class CornerCloseRepair:
             except Exception:
                 continue
             pts.append((p.X(), p.Y(), p.Z()))
+        cache[ck] = pts
         return pts
+
+    @staticmethod
+    def _pts_bbox(pts):
+        """点列包围盒 (mn, mx)；空列返回 None。"""
+        if not pts:
+            return None
+        xs = [p[0] for p in pts]
+        ys = [p[1] for p in pts]
+        zs = [p[2] for p in pts]
+        return ((min(xs), min(ys), min(zs)), (max(xs), max(ys), max(zs)))
+
+    @staticmethod
+    def _bbox_gap(b1, b2):
+        """两个包围盒之间的最短距离（相交/相接为 0）。"""
+        if b1 is None or b2 is None:
+            return 0.0
+        d2 = 0.0
+        for a, b in zip(zip(b1[0], b1[1]), zip(b2[0], b2[1])):
+            lo1, hi1 = a
+            lo2, hi2 = b
+            if hi1 < lo2:
+                d = lo2 - hi1
+            elif hi2 < lo1:
+                d = lo1 - hi2
+            else:
+                d = 0.0
+            d2 += d * d
+        return math.sqrt(d2)
 
     @staticmethod
     def _polyline_closest(pa, pb, na=9, nb=9):
@@ -215,14 +258,24 @@ class CornerCloseRepair:
 
     @staticmethod
     def _polyline_min_dist(pa, pb, na=7, nb=7):
-        """两条 3D 折线点列之间的最小距离（分段线性采样近似）。"""
+        """两条 3D 折线点列之间的最小距离（分段线性采样近似）。
+
+        P8：分段包围盒预筛——段对包围盒距离 ≥ 当前最优时整对跳过
+        （该段对任何采样点都不可能更近），保持原有采样语义不变。
+        """
         if not pa or not pb:
             return 1e18
+        # 分段包围盒（每段一次性预计算）
+        seg_a = [(pa[i], pa[i + 1],
+                  CornerCloseRepair._pts_bbox((pa[i], pa[i + 1]))) for i in range(len(pa) - 1)]
+        seg_b = [(pb[j], pb[j + 1],
+                  CornerCloseRepair._pts_bbox((pb[j], pb[j + 1]))) for j in range(len(pb) - 1)]
         best = 1e18
-        for i in range(len(pa) - 1):
-            a0, a1 = pa[i], pa[i + 1]
-            for j in range(len(pb) - 1):
-                b0, b1 = pb[j], pb[j + 1]
+        for a0, a1, ba in seg_a:
+            for b0, b1, bb in seg_b:
+                # 段对包围盒都不可能更近 → 跳过（不改变采样结果）
+                if CornerCloseRepair._bbox_gap(ba, bb) >= best:
+                    continue
                 for s in range(na + 1):
                     qa = (a0[0] + (a1[0] - a0[0]) * s / na,
                           a0[1] + (a1[1] - a0[1]) * s / na,
@@ -371,6 +424,9 @@ class CornerCloseRepair:
         cls = topo['classification']
         planar = [fi for fi in cls.get('planar_faces', [])]
 
+        # P8：每次检测重建离散缓存（extractor 生命周期内有效）
+        self._pts_cache = {}
+
         thick_set = set()
         for p in topo.get('thickness_pairs', []):
             thick_set.add(tuple(sorted(p)))
@@ -389,10 +445,19 @@ class CornerCloseRepair:
             origin = tuple(sp.get('origin') or (0, 0, 0))
             area = faces[fi]['area']
             small = bool(self.skip_small_features and area < self.min_flange_area)
+            # P8：面包围盒（AddOptimal 精确包围盒，失败则禁用该面的预筛）
+            bbox = None
+            try:
+                fb = Bnd_Box()
+                BRepBndLib.AddOptimal_s(ext._face_shapes[fi], fb)
+                xmin, ymin, zmin, xmax, ymax, zmax = fb.Get()
+                bbox = ((xmin, ymin, zmin), (xmax, ymax, zmax))
+            except Exception:
+                bbox = None
             info[fi] = {
                 'normal': normal, 'origin': origin, 'area': area,
                 'free': sorted(set(fe_by_face.get(fi, []))),
-                'small': small,
+                'small': small, 'bbox': bbox,
             }
 
         candidates = []
@@ -407,6 +472,10 @@ class CornerCloseRepair:
                 # 排除相邻面：相邻（共享边）即已连接，其间隙只是板厚偏移，非开放角落。
                 if fa in faces[fb].get('adjacent_faces', []) or fb in faces[fa].get('adjacent_faces', []):
                     continue
+                # P8：面包围盒预筛——两面包围盒相距已超过 max_gap_detect 时，
+                # 任何边对间隙必然 > max_gap_detect（最终也会被拒），提前跳过。
+                if self._bbox_gap(info[fa]['bbox'], info[fb]['bbox']) > self.max_gap_detect:
+                    continue
                 na, nb = info[fa]['normal'], info[fb]['normal']
                 c = _cross(na, nb)
                 if _norm(c) < 1e-6:
@@ -420,14 +489,21 @@ class CornerCloseRepair:
                 fb_edges = info[fb]['free']
                 if not fa_edges or not fb_edges:
                     continue
+                # P8：离散缓存 + 边包围盒（同一 ext 内跨面组合复用）
                 pa_cache = {e: self._edge_points(ext, e) for e in fa_edges}
                 pb_cache = {e: self._edge_points(ext, e) for e in fb_edges}
+                pa_bbox = {e: self._pts_bbox(pa_cache[e]) for e in fa_edges}
+                pb_bbox = {e: self._pts_bbox(pb_cache[e]) for e in fb_edges}
                 # 在所有自由边对中，只保留【共面】（同一法兰平面内、可形成尖角）
                 # 且间隙在 (gap_tol, max_gap] 的边对，取间隙最小者。
                 best = 1e18
                 best_pair = (None, None)
                 for ea in fa_edges:
                     for eb in fb_edges:
+                        # P8：边包围盒预筛（bbox 距离 > max_gap_detect 的边对
+                        # 不可能进入最终候选，语义不变地跳过）
+                        if self._bbox_gap(pa_bbox[ea], pb_bbox[eb]) > self.max_gap_detect:
+                            continue
                         if not self._edges_coplanar(pa_cache[ea], pb_cache[eb]):
                             continue
                         d = self._polyline_min_dist(pa_cache[ea], pb_cache[eb])
@@ -458,10 +534,15 @@ class CornerCloseRepair:
                 })
 
         # 去重：同一缺口位置只保留一个角落（避免重复闭合同一物理角落）。
+        # B12：gap_pos 为 None 时原实现统一 setdefault(('free',), c)，
+        # 只保留第一个候选，语义不同的角落被静默丢弃。改用
+        # (边对, 面对) 唯一键，保证每个不同候选都保留。
         dedup = {}
         for c in candidates:
             if c['gap_pos'] is None:
-                dedup.setdefault(('free',), c)
+                key = ('free', c['edge_pair'], c['faces'])
+                if key not in dedup:
+                    dedup[key] = c
                 continue
             key = (round(c['gap_pos'][0], 3), round(c['gap_pos'][1], 3), round(c['gap_pos'][2], 3))
             if key not in dedup:

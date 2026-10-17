@@ -58,6 +58,17 @@ python moldkit\webapp.py               # moldkit 控制台（127.0.0.1:5002）
 `*.stp` 等几何文件默认不入库（单件 1–3 MB、全量约 185 MB，且多为客户件）。
 需要纳入某件时 `git add -f <文件>`；需要全量纳入时改用 Git LFS。
 
+## 推送到 GitHub
+
+本机 `hosts` 把 `github.com` 钉到了一个只读加速器（clone/ls-remote 正常，`git push` 返回 **403**）。
+本仓库提供绕过脚本，直连真实 IP 推送：
+
+```powershell
+powershell -ExecutionPolicy Bypass -File tools\push-github.ps1
+```
+
+凭据取自 Windows 凭据管理器（与 git 相同），不落盘、不改系统 hosts。根治办法是在加速器里关掉 `github.com` 那条记录。
+
 ## 当前状态
 
 - 已有：完整生成/修复/校验链路，两条渲染与两套 Web 控制台，CLI 与软件包双形态。

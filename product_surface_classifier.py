@@ -27,7 +27,7 @@ product_surface_classifier.py —— 按【投影法】识别钣金产品上/下
   _extract_solids / _make_compound，供 mold_contact_surface_extractor 调用。
 
 【API】
-  classify_product_surfaces(shape, margin=None, nz_eps=0.02, n_samples=3) -> dict
+  classify_product_surfaces(shape, margin=None, nz_eps=0.1, n_samples=3) -> dict
     返回 { plane_A_z, plane_B_z, margin, upper_faces, lower_faces,
            face_count, faces=[每面诊断] }
     其中 upper_faces / lower_faces 为 [(idx, TopoDS_Face)]。
@@ -186,6 +186,7 @@ def classify_product_surfaces(shape, margin=None, nz_eps=DEFAULT_NZ_EPS,
     faces = []
     upper = []
     lower = []
+    unknown = []
     exp = TopExp_Explorer(shape, TopAbs_FACE)
     idx = 0
     while exp.More():
@@ -195,7 +196,11 @@ def classify_product_surfaces(shape, margin=None, nz_eps=DEFAULT_NZ_EPS,
         # 沿 ±Z 正交投影到面A / 面B 的面积（= 面面积 × |Z向单位法向分量|）
         proj_top = area * max(nz, 0.0)
         proj_bottom = area * max(-nz, 0.0)
-        if nz > nz_eps:
+        # B15：采样失败（n_valid==0）与"真竖直侧壁"必须区分——前者是
+        # 法向算不出来，不能静默当成 side 丢弃（真实上/下表面可能因此漏判）。
+        if n_valid == 0:
+            cls = 'unknown'        # 无法判定，暴露给调用方，不混入 upper/lower
+        elif nz > nz_eps:
             cls = 'upper'
         elif nz < -nz_eps:
             cls = 'lower'
@@ -214,6 +219,8 @@ def classify_product_surfaces(shape, margin=None, nz_eps=DEFAULT_NZ_EPS,
             upper.append((idx, TopoDS.Face_s(face)))
         elif cls == 'lower':
             lower.append((idx, TopoDS.Face_s(face)))
+        elif cls == 'unknown':
+            unknown.append((idx, TopoDS.Face_s(face)))
         idx += 1
         exp.Next()
 
@@ -224,6 +231,7 @@ def classify_product_surfaces(shape, margin=None, nz_eps=DEFAULT_NZ_EPS,
         'face_count': idx,
         'upper_faces': upper,
         'lower_faces': lower,
+        'unknown_faces': unknown,
         'faces': faces,
     }
 
@@ -256,8 +264,9 @@ def main(argv=None):
     print(f"面 B(z)    : {res['plane_B_z']}   (Zmin - {res['margin']})")
     print(f"上表面 U   : {len(res['upper_faces'])} 片（沿+Z投影面A有面积）")
     print(f"下表面 L   : {len(res['lower_faces'])} 片（沿-Z投影面B有面积）")
+    print(f"未判定 ?   : {len(res.get('unknown_faces', []))} 片（法向采样失败，需人工确认）")
     print("-" * 64)
-    label_map = {'upper': '上', 'lower': '下', 'side': '侧壁'}
+    label_map = {'upper': '上', 'lower': '下', 'side': '侧壁', 'unknown': '未知'}
     for f in res['faces']:
         print(f"  #{f['index']:>3}  {label_map[f['cls']]}  面积={f['area']:.4f}  "
               f"nz={f['nz']:+.3f}  面A投影={f['proj_top_area']:.3f}  "

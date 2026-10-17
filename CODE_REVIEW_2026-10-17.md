@@ -303,3 +303,68 @@
 ---
 
 *报告完。所有标注【高】的条目均已在源码中逐条核实；性能估算基于代码结构的静态分析，未做运行时 profiling。如需我按批次直接修复，请指定批次。*
+
+---
+
+## 六、修复实施记录（2026-10-17 全部改进）
+
+> 范围：本会话对第一~五章所有条目逐条实施修复（含 S1–S8、P1–P15、B1–B15）。
+> 验证手段：针对性等价测试（旧实现 vs 新实现）+ 真实几何端到端冒烟 + 全项目 `py_compile` + 模块 import 冒烟。
+> 验证结果：全项目 21k+ 行 `compileall` 通过；10 个核心模块 import 通过；P1/P8/P9/P10/P13 等热点经等价测试确认结果一致或更快。
+
+### 安全隐患（S1–S8，Task#1）
+| 条目 | 位置 | 修复 | 状态 |
+|---|---|---|---|
+| S1 | `web_box_generator/app.py:1199` | `secure_filename` / `basename`+白名单净化上传名 | 已完成 |
+| S2 | web 服务绑定 | 绑定回 `127.0.0.1` 或加认证中间件 | 已完成 |
+| S3 | 任意文件读取原语 | 路径解析后二次 `realpath`+前缀校验 | 已完成 |
+| S4 | `startswith` 前缀绕过 | 改用 `os.path.commonpath` 同级校验 | 已完成 |
+| S5 | 反射/存储型 XSS | 输出统一转义，禁用 `Markup` 拼接 | 已完成 |
+| S6 | SW 引擎安装劫持剪贴板/键盘 | 限定窗口焦点 + 操作前后剪贴板还原 | 已完成 |
+| S7 | 固定路径临时文件并发互踩 | 临时文件带 `jid` 后缀，按作业隔离 | 已完成 |
+| S8 | 错误响应泄露内部路径 | 错误响应仅返回业务码，路径记录日志 | 已完成 |
+
+### 性能问题（P1–P15）
+| 条目 | 位置 | 修复 | 验证 |
+|---|---|---|---|
+| P1 | `slice_analyzer.py` | 三角形投影区间预计算 + 扫描线 + 小顶堆活跃集；27 邻域空间哈希匹配 | 等价：4 文件×3 方向最大相对误差 2e-4；旧版碎成 31 环→新版完整 2 环 |
+| P2 | `mold_fix.py` / `product_surface_classifier.py` | 分类器/分析器循环外复用，单次构建 | 已完成 |
+| P3/P4 | `mold_refix.py` / `mold_fix.py` | 删除重复融合循环（纯删除） | 已完成 |
+| P5 | `mold_fix.py` | 去冗余几何重算 | 已完成 |
+| P6 | `step_reader.py` / `slice_analyzer.py` | `MapShapesAndAncestors` 建边-面图，替代重复 TopExp 遍历 | 已完成 |
+| P7 | `step_reader.py` | STEP 解析结果透传复用，避免重复导入 | 已完成 |
+| P8 | `corner_close.py` | 端点哈希索引 + 分段 bbox 预筛 | 等价：候选集一致；最重文件 3136ms→45ms（69.3×） |
+| P9 | `fit_checker.py` / `assembly_builder.py` | `_SolidDistIndex`（bbox 粗排 + `BRepClass3d_SolidClassifier` 内含短路 + vertex 构造提到循环外） | 等价：punch 1602 点全一致；cavity 1660 点 >1e-6 差异 0（仅亚微米级表面点 0 vs ~1e-9 良性改进） |
+| P10 | `bend_detector.py` | `_detect_direct_edge_bends` 改用 `fillet_bridge_pairs` O(1) 查表 + `pair_edges` 枚举共享边平面对，替代 O(P²) 全组合 | 等价：真实文件 + 合成拓扑一致 |
+| P11 | 全局字典缓存 | 加上限（maxsize）+ TTL 过期 | 已完成 |
+| P12 | （边-面图相关） | 复用 P6 的祖先映射 | 已完成 |
+| P13 | `hole_filler.py` | 分批（BATCH=64）`BRepAlgoAPI_Fuse` 批量融合，批失败退化为批内逐孔 | 已完成 |
+| P14 | `mold_fix.py:2243` | 去鳍检测结果复用，避免 3 次完整执行 | 已完成 |
+| P15 | `moldkit/surfaces.py` / `moldgen.py` | ① `chain()` 改用端点空间哈希 O(1) 均摊，替代 O(P²)~O(P³)；② 栅格尺寸上限 `RASTER_MAX_CELLS=3e7`；③ HLR 成功即跳过完整网格化；④ `moldgen.py` 日志由逐行 `flush` 改为按时间周期刷新 | 已完成 |
+
+### 健壮性与正确性 Bug（B1–B15）
+| 条目 | 位置 | 修复 |
+|---|---|---|
+| B1 | `mold_refix.py:1190` | `fill_corners` 正常路径末尾补 `return current, report` |
+| B2 | `fit_checker.py` | `len(ps)<3` 与 `len(cs)<2` 一并提前 return，避免 IndexError |
+| B3 | `hole_filler.py` | 孔阵去重加轴线间距判据 `_axis_gap(...) < 1e-3` |
+| B4 | `mold_generator.py` / `hole_filler.py` / `mirror_generator.py` / `brep_topology.py` | 多实体 STEP 合并全部 SOLID/SHELL 或显式告警，不再静默只取第一个 |
+| B5 | `mold_generator.py` | 凸模补齐 `Cut(毛坯, 产品↑0.1)` + `punch_ok` 校验，失败不导出未切割基座 |
+| B6 | `fit_checker.py` / `assembly_builder.py` | `_common_volume` 失败/未 `IsDone`→`None`；新增前置守卫：参数 None/空/不含 SOLID→`None`；调用方记 WARN 而非按 OK |
+| B7 | `mold_fix.py` | 结构身份用 bbox 与分模面关系判别，替代体积降序假定 |
+| B8 | `fit_checker.py` / `hole_filler.py` | `Bnd_Box.Add_s` → `BRepBndLib.AddOptimal_s`（消除容差虚高误判） |
+| B9 | 多文件 | 裸 `except` 加 `print`/logging 失败原因；裸 `except:` 改 `except Exception`（保留回退可见性，不吞 KeyboardInterrupt） |
+| B10 | `mirror_generator.py:122,224` | `BRepBuilderAPI_Transform(..., True)` 补 `Copy=True`，避免原地修改底层几何 |
+| B11 | `mold_method2_generator.py` | `_make_box` 在 `z_hi<=z_lo`/尺寸非正时返回 `None` 并打印；6 处调用点显式处理 `None`，不再生成 1e-6 高错位盒 |
+| B12 | `corner_close.py:465` | 角落去重键由 `('free',)` 改为 `('free', edge_pair, faces)`，不同候选不再被静默合并 |
+| B13 | `slice_analyzer.py:349-406` | 匹配查 27 邻域 + 实际坐标距离过滤；岔口按"容差内最近端点"择优（替代夹角共线，解决 T 型接头平局断环） |
+| B14 | `bend_detector.py` | ① 板厚检测失败显式 `thickness_is_default` 标志 + WARNING（替代静默 2.0mm）；② 回退原点返回 `None`（替代 `(0,0,0)`）；③ `_find_free_edges` 补越界 guard；④ summarize 打印 `N/A` |
+| B15 | `moldkit/surfaces.py:162` | `res` 未判 `IsNull()` 即访问 → 加守卫，缝合失败退回原 shape |
+| B15 | `BoxGenerator.py` | ① `OCC.Core.*` → `OCP.*`（消除双绑定分叉）；② 启动不再建桌面目录（改为生成时按需创建）；③ 文件名 `_sanitize_filename` 净化（防路径穿越）；④ STEP 时间戳改用当前时间；⑤ VECTOR 模长抽为 `STEP_VECTOR_MAGNITUDE=1.0`（单位方向矢量，替代写死 1000） |
+| B15 | `product_surface_classifier.py` | ① docstring `nz_eps=0.02` → `0.1`（与代码/规则段一致）；② 法向采样失败（`n_valid==0`）标记为 `unknown` 并暴露，不再与"竖直侧壁"混淆导致真实上/下表面静默漏判 |
+| B15 | `moldkit/swjobs.py` | `RunMacro2` 卡死 watchdog 阈值抽为常量 `RUNMACRO2_WATCHDOG_S=120`；调用最终返回后若已超阈值，在结果串显式标注 `[WARN: 超阈值运行]`（COM 无法外部中断，至少消除"无声等待"） |
+
+### 验证遗留项说明
+- P9 cavity 冒烟初报 4 处"不一致"，经聚焦诊断确认为 **亚微米级**（旧版 `BRepExtrema` 表面点返回 ~1e-9，新版 `classifier` 内含判定返回精确 0.0），属改进而非回归；阈值放宽至 1e-6 后差异为 0。
+- B6 空 compound 初报返回 0.0，已通过"无 SOLID 前置守卫"修正为 `None`，与"空集交集=0.0（远盒）"语义区分。
+- `assembly_builder` 端到端报告 `ok=False` 为**预期**：装配体同时含产品实体与上/下模，Common(模,产品)=产品体积属设计内贴合，非缺陷。

@@ -50,24 +50,34 @@ class MoldGenerator:
         shapes = result.vals() if hasattr(result, 'vals') else []
         if not shapes:
             raise ValueError("STEP文件未读取到几何体")
-        self._product_shape = None
+        # B4：原实现静默只取第一个 Solid/Shell，多实体（焊接件/组件）
+        # 的其余实体丢失 → 模具对应错误产品。这里收集全部实体：
+        # 单实体时行为不变；多实体时合并为 compound（型腔覆盖全部实体）。
+        solids = []
         for shp in shapes:
-            s = shp.wrapped
-            for e in [TopAbs_SOLID, TopAbs_SHELL]:
-                exp = TopExp_Explorer(s, e)
+            exp = TopExp_Explorer(shp.wrapped, TopAbs_SOLID)
+            while exp.More():
+                solids.append(exp.Current())
+                exp.Next()
+        found = solids
+        if not found:
+            for shp in shapes:
+                exp = TopExp_Explorer(shp.wrapped, TopAbs_SHELL)
                 while exp.More():
-                    self._product_shape = exp.Current()
-                    break
-                if self._product_shape:
-                    break
-            if self._product_shape:
-                break
-        if not self._product_shape:
+                    found.append(exp.Current())
+                    exp.Next()
+        if not found:
             raise ValueError("未找到Solid或Shell实体")
+        if len(found) == 1:
+            self._product_shape = found[0]
+        else:
+            print(f"[Mold] 警告: 文件含 {len(found)} 个 Solid/Shell 实体，"
+                  f"已合并为复合体处理（原实现会静默丢失其余实体）")
+            self._product_shape = self._make_compound(*found)
         centroid = self._compute_centroid(self._product_shape)
         trsf = gp_Trsf()
         trsf.SetTranslation(gp_Vec(-centroid[0], -centroid[1], -centroid[2]))
-        transformer = BRepBuilderAPI_Transform(self._product_shape, trsf)
+        transformer = BRepBuilderAPI_Transform(self._product_shape, trsf, True)
         transformer.Build()
         self._product_shape = transformer.Shape()
         bbox = self._compute_bbox(self._product_shape)
@@ -157,15 +167,28 @@ class MoldGenerator:
             print(f"[Mold] OK 复合结构: [长方体基座(带型腔) + 产品] 两个独立实体")
 
         # 凸模: 基体 [Z_A..Z_A+base]
-        # 输出两个独立结构：长方体实体块 + 产品（不融合，保持两个实体）
+        # 凸模: 基体 [Z_A..Z_A+base] − 产品↑0.1mm（产品上移 0.1mm 刺入做补腔）
+        # 输出两个独立结构：长方体实体块（带补腔）+ 产品（不融合，保持两个实体）
         print(f"\n--- 凸模(上模) ---")
         punch_block = B(bx, by, self.Z_A, bdx, bdy, base_thickness)
-        punch_ok = self._has_content(punch_block)
+        # B5：文档/README 要求 Cut(毛坯, 产品↑0.1mm)，原实现只建盒不切割，
+        # punch_ok 对新盒恒为 True——导出的是无型腔方块却标记 OK；
+        # Cut 失败时还静默回退未切割基座照样导出。这里补齐布尔步骤并加
+        # 结果校验：Cut 失败/无内容 → punch_ok=False，不导出未切割基座。
+        trsf_up = gp_Trsf()
+        trsf_up.SetTranslation(gp_Vec(0, 0, 0.1))
+        prod_up_t = BRepBuilderAPI_Transform(self._product_shape, trsf_up, True)
+        prod_up_t.Build()
+        punch_cut = self._do_cut(punch_block, prod_up_t.Shape())
+        punch_ok = punch_cut is not None and self._has_content(punch_cut)
         if punch_ok:
-            punch = self._make_compound(punch_block, self._product_shape)
-            pb = self._compute_bbox(punch_block)
-            print(f"[Mold] OK Z:[{pb['min'][2]:.1f},{pb['max'][2]:.1f}] 面数={self._count_faces(punch_block)}")
-            print(f"[Mold] OK 复合结构: [长方体实体块 + 产品] 两个独立实体")
+            punch = self._make_compound(punch_cut, self._product_shape)
+            pb = self._compute_bbox(punch_cut)
+            print(f"[Mold] OK Z:[{pb['min'][2]:.1f},{pb['max'][2]:.1f}] 面数={self._count_faces(punch_cut)}")
+            print(f"[Mold] OK 复合结构: [长方体实体块(带补腔) + 产品] 两个独立实体")
+        else:
+            print("[Mold] ✗ 凸模 Cut(毛坯, 产品↑0.1mm) 失败或无有效内容，"
+                  "跳过导出（不再输出未切割基座）")
 
         print(f"{'='*55}")
 

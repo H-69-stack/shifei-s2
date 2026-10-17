@@ -230,13 +230,25 @@ def _valid(shape):
 
 
 def _make_box(lx, ly, cx, cy, z_lo, z_hi):
-    """生成长方体：x∈[cx-lx/2,cx+lx/2]，y∈[cy-ly/2,cy+ly/2]，z∈[z_lo,z_hi]。"""
-    box = BRepPrimAPI_MakeBox(lx, ly, max(z_hi - z_lo, 1e-6)).Shape()
+    """生成长方体：x∈[cx-lx/2,cx+lx/2]，y∈[cy-ly/2,cy+ly/2]，z∈[z_lo,z_hi]。
+
+    B11：Z 区间倒置或尺寸非正时返回 None（附原因打印），不再静默生成
+    `max(z_hi - z_lo, 1e-6)` 的 1e-6 高盒子——那种盒位置错误且无任何报错，
+    下游布尔会得到莫名其妙的结果。调用方必须处理 None。
+    """
+    if lx <= 0.0 or ly <= 0.0:
+        print(f"  [B11] _make_box 尺寸非正: lx={lx:.4f} ly={ly:.4f} → None")
+        return None
+    if z_hi <= z_lo:
+        print(f"  [B11] _make_box Z 区间倒置: z_lo={z_lo:.4f} z_hi={z_hi:.4f} → None")
+        return None
+    box = BRepPrimAPI_MakeBox(lx, ly, z_hi - z_lo).Shape()
     from OCP.gp import gp_Trsf
     from OCP.BRepBuilderAPI import BRepBuilderAPI_Transform
     t = gp_Trsf()
     t.SetTranslation(gp_Vec(cx - lx / 2.0, cy - ly / 2.0, z_lo))
-    return BRepBuilderAPI_Transform(box, t).Shape()
+    # 与 B10 一致：Copy=True，避免原地修改底层几何
+    return BRepBuilderAPI_Transform(box, t, True).Shape()
 
 
 def _stretch_up(faces, z_end):
@@ -302,7 +314,15 @@ def _clamp_to_box(shape, x1, y1, z1, x2, y2, z2, label="clamp"):
     布尔（尤其对开放壳/薄壁）偶尔会把结果甩到包围盒之外（实测法二A 下模
     顶面超出基座顶面 +6mm）。本函数作为最后一道保险：Cut(shape, 盒外体)。
     失败/无变化时原样返回。
+
+    B11：盒区间本身倒置（x2<=x1 / y2<=y1 / z2<=z1）时原样返回并告警，
+    不再把负尺寸传进 BRepPrimAPI_MakeBox 造错位盒。
     """
+    if x2 <= x1 or y2 <= y1 or z2 <= z1:
+        print(f"  [B11] _clamp_to_box 盒区间倒置: "
+              f"x[{x1:.3f},{x2:.3f}] y[{y1:.3f},{y2:.3f}] z[{z1:.3f},{z2:.3f}]"
+              f" → 不裁剪，原样返回")
+        return shape
     try:
         pad = max(x2 - x1, y2 - y1, z2 - z1) + 50.0
         outer = BRepPrimAPI_MakeBox(pad + (x2 - x1), pad + (y2 - y1),
@@ -372,6 +392,10 @@ class MoldMethod2Generator:
         if not ok or stretched is None:
             return {'success': False, 'error': '上形变面拉伸失败'}
         upper_box = _make_box(span_lx, span_ly, cx, cy, P, z_end + 20.0)
+        if upper_box is None:
+            return {'success': False, 'error':
+                    f'上模裁剪盒构造失败（区间倒置: P={P:.3f}, '
+                    f'z_end+20={z_end + 20.0:.3f}）'}
         ok, punch = _cut(stretched, upper_box, "punch-cut")
         if not ok or punch is None:
             return {'success': False, 'error': '上模顶面裁剪失败'}
@@ -429,6 +453,10 @@ class MoldMethod2Generator:
             base_hz = h_cavity + dt            # 顶部空腔 + 底部垫厚
         z_lo = z_top - base_hz
         base = _make_box(base_lx, base_ly, cx, cy, z_lo, z_top)
+        if base is None:
+            return {'success': False, 'error':
+                    f'下模基座盒构造失败（区间倒置: z_lo={z_lo:.3f}, '
+                    f'z_top={z_top:.3f}）'}
 
         # ★去掉 Common★ cavity = Cut(基座, vup)。
         # 旧写法 `Common(vup, cavity_zone)` 里 vup 是【多实体 compound】（下形变面
@@ -499,6 +527,10 @@ class MoldMethod2Generator:
         # 下模：盒[Z_B-base_z .. Z_A] − 产品
         z_lo_c = Z_B - base_thk
         box_c = _make_box(base_lx, base_ly, cx, cy, z_lo_c, Z_A)
+        if box_c is None:
+            return {'success': False, 'error':
+                    f'下模型腔盒构造失败（区间倒置: z_lo={z_lo_c:.3f}, '
+                    f'Z_A={Z_A:.3f}）'}
         ok, cavity = _cut(box_c, product, "m2b-cavity")
         if not ok or cavity is None:
             return {'success': False, 'error': '下模(盒−产品)布尔失败'}
@@ -576,6 +608,10 @@ class MoldMethod2Generator:
         if punch is None:
             punch_src = 'block'
             punch = _make_box(base_lx, base_ly, cx, cy, Z_A, P_top)
+            if punch is None:
+                return {'success': False, 'error':
+                        f'上模实体块构造失败（区间倒置: Z_A={Z_A:.3f}, '
+                        f'P_top={P_top:.3f}）'}
             print("  上模回退稳定实体块（两种内核均不可用）")
         punch_res = self._result('punch', product_filepath, punch, {
             'h1': h1, 'P': P_top, 'Z_A': Z_A, 'Z_B': Z_B,
@@ -741,9 +777,11 @@ class MoldMethod2Generator:
                 cap = _make_box(pbb[3] - pbb[0], pbb[4] - pbb[1],
                                 (pbb[0] + pbb[3]) / 2.0, (pbb[1] + pbb[4]) / 2.0,
                                 pbb[5], P)
-            ok, merged = _fuse(body, cap, "上模-封顶", fuzz=1e-3)
-            if ok and merged is not None:
-                body = merged
+            # B11：P 不高于产品顶面时无封顶空间，cap 为 None → 跳过融合
+            if cap is not None:
+                ok, merged = _fuse(body, cap, "上模-封顶", fuzz=1e-3)
+                if ok and merged is not None:
+                    body = merged
         # 减去产品本体（贴合产品上表面）
         ok, cut = _cut(body, product, "上模-去产品", fuzz=1e-4)
         if ok and cut is not None:
@@ -752,9 +790,10 @@ class MoldMethod2Generator:
         span = max(pbb[3] - pbb[0], pbb[4] - pbb[1]) + 2 * self.margin + 20.0
         cx, cy = (pbb[0] + pbb[3]) / 2.0, (pbb[1] + pbb[4]) / 2.0
         top_box = _make_box(span, span, cx, cy, P, P + span + 50.0)
-        ok, cut = _cut(body, top_box, "上模-裁顶", fuzz=1e-4)
-        if ok and cut is not None:
-            body = cut
+        if top_box is not None:
+            ok, cut = _cut(body, top_box, "上模-裁顶", fuzz=1e-4)
+            if ok and cut is not None:
+                body = cut
         return body, len(prisms), n_skip
 
     # ---------------- 结果 / 导出 ----------------

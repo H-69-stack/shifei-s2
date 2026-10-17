@@ -138,7 +138,19 @@ def _solid_count(shape):
 
 
 def _common_volume(a, b):
-    """两实体 Common 交集体积（近似 0 表示无重叠/无干涉）。"""
+    """两实体 Common 交集体积（近似 0 表示无重叠/无干涉）。
+
+    B6：布尔失败/未完成时返回 None（与"交集体积≈0"明确区分），
+    由调用方记 WARN 按未知处理，不再静默按 0 放过。
+
+    前置守卫：任一参数为 None/空/不含任何 SOLID 时无法判定，同样返回
+    None（空 compound 经 OCC 会"成功"返回空集体积 0，会被误判为"已确认
+    无重叠"——这里显式拦截，避免静默漏报）。
+    """
+    if a is None or b is None or a.IsNull() or b.IsNull():
+        return None
+    if _solid_count(a) == 0 or _solid_count(b) == 0:
+        return None
     try:
         c = BRepAlgoAPI_Common(a, b)
         c.SetRunParallel(False)
@@ -148,7 +160,90 @@ def _common_volume(a, b):
             return _solid_volume(c.Shape())
     except Exception:
         pass
-    return 0.0
+    return None
+
+
+def _bbox_point_gap(bb, pnt):
+    """包围盒 (x1,y1,z1,x2,y2,z2) 到点的最短距离（内部/表面上为 0）。"""
+    x1, y1, z1, x2, y2, z2 = bb
+    d2 = 0.0
+    for lo, hi, c in ((x1, x2, pnt.X()), (y1, y2, pnt.Y()), (z1, z2, pnt.Z())):
+        if c < lo:
+            d = lo - c
+        elif c > hi:
+            d = c - hi
+        else:
+            d = 0.0
+        d2 += d * d
+    return math.sqrt(d2)
+
+
+class _SolidDistIndex:
+    """P9：点到实体距离查询索引。
+
+    原实现每个采样点都对 compound 内每个 SOLID 各做一次
+    BRepExtrema_DistShapeShape，循环内还重复构造 vertex、无任何
+    预筛。这里预枚举 SOLID/SHELL + 包围盒 + SolidClassifier：
+      - 内含短路：分类器命中 TopAbs_IN 即距离 0（远比 BVH 距离快）
+      - bbox 下界粗排：下界已不优于当前最优时跳过精确距离计算
+      - vertex 每个查询只构造一次
+    距离语义与原实现一致（内部/表面为 0；返回最小最近距离）。
+    """
+    __slots__ = ('entries', '_shape')
+
+    def __init__(self, shape):
+        self._shape = shape
+        self.entries = []
+        if shape is None:
+            return
+        for tp in (TopAbs_SOLID, TopAbs_SHELL):
+            exp = TopExp_Explorer(shape, tp)
+            while exp.More():
+                shp = exp.Current()
+                bb = None
+                try:
+                    b = Bnd_Box()
+                    BRepBndLib.AddOptimal_s(shp, b)
+                    if not b.IsVoid():
+                        bb = b.Get()
+                except Exception:
+                    bb = None
+                clsf = None
+                if tp == TopAbs_SOLID:
+                    try:
+                        clsf = BRepClass3d_SolidClassifier(shp)
+                    except Exception:
+                        clsf = None
+                self.entries.append((shp, bb, clsf))
+                exp.Next()
+
+    def dist(self, pnt):
+        """点到实体最近距离（内部/表面为 0）。无几何/失败返回 None。"""
+        if not self.entries:
+            return None
+        best = None
+        vertex = None
+        for shp, bb, clsf in self.entries:
+            if clsf is not None:
+                try:
+                    clsf.Perform(pnt, 1e-6)
+                    if clsf.State() == TopAbs_IN:
+                        return 0.0
+                except Exception:
+                    pass
+            if bb is not None and best is not None and _bbox_point_gap(bb, pnt) >= best:
+                continue
+            try:
+                if vertex is None:
+                    vertex = BRepBuilderAPI_MakeVertex(pnt).Vertex()
+                d = BRepExtrema_DistShapeShape(shp, vertex)
+                d.Perform()
+                if d.IsDone():
+                    val = d.Value()
+                    best = val if best is None else min(best, val)
+            except Exception:
+                pass
+        return best
 
 
 def _point_inside(shape, pnt, tol=1e-6):
@@ -259,16 +354,15 @@ def _sample_face_points(face, cap=12):
     return out
 
 
-def _dist_point_solid(pnt, solid):
-    """点到实体的最近距离（点在其内部/表面为 0）。失败返回 None。"""
-    try:
-        v = BRepBuilderAPI_MakeVertex(pnt).Vertex()
-        dss = BRepExtrema_DistShapeShape(v, solid)
-        if dss.IsDone():
-            return dss.Value()
-    except Exception:
-        pass
-    return None
+def _dist_point_solid(pnt, solid, index=None):
+    """点到实体的最近距离（点在其内部/表面为 0）。失败返回 None。
+
+    P9：传入预建的 _SolidDistIndex 可避免每个采样点重复枚举
+    SOLID / 构造 vertex / 无预筛的开销；不传则临时构建（兼容旧调用）。
+    """
+    if index is None:
+        index = _SolidDistIndex(solid)
+    return index.dist(pnt)
 
 
 # =====================================================================
@@ -317,7 +411,10 @@ class FitChecker:
         if len(cs) < 2:
             issues.append({'severity': 'FAIL', 'check': 'structure',
                            'msg': f"凹模文件应含 2 个结构体（型腔/产品），实际 {len(cs)} 个"})
-        if not ps or not cs:
+        # B2：结构体数量不足时，后续 ps[2]/cs[1] 索引没有意义
+        #（len(ps)==1 时 ps[1] 直接 IndexError，与凹模侧保护不对称）。
+        # 提前返回，不做猜测性索引。
+        if len(ps) < 3 or len(cs) < 2:
             return FitChecker._finalize(issues, checks, gaps, t0)
 
         base_p = ps[0][1]
@@ -341,11 +438,17 @@ class FitChecker:
 
         if product_p is not None and product_c is not None:
             v = _common_volume(product_p, product_c)
-            vp = max(_solid_volume(product_p), 1e-9)
-            checks['product_consistency'] = round(v / vp, 4)
-            if v / vp < 0.95:
+            if v is None:
+                # B6：布尔失败不再伪装成"无重叠"——按未知处理并告警
+                checks['product_consistency'] = None
                 issues.append({'severity': 'WARN', 'check': 'consistency',
-                               'msg': "凸模内产品与凹模内产品不一致，请确认同产品/同坐标系"})
+                               'msg': "凸模内产品与凹模内产品一致性检查失败（布尔运算未完成），请人工确认"})
+            else:
+                vp = max(_solid_volume(product_p), 1e-9)
+                checks['product_consistency'] = round(v / vp, 4)
+                if v / vp < 0.95:
+                    issues.append({'severity': 'WARN', 'check': 'consistency',
+                                   'msg': "凸模内产品与凹模内产品不一致，请确认同产品/同坐标系"})
 
         # ---- 分模面 / 型腔开口 ----
         Z_A = _bbox_tuple(product)[5] if product is not None else _bbox_tuple(product_p)[5]
@@ -372,6 +475,13 @@ class FitChecker:
             if a is None or b is None:
                 continue
             v = _common_volume(a, b)
+            if v is None:
+                # B6：布尔失败不再伪装成"无重叠"——按未知处理并告警
+                checks[f'interfere_{name}'] = None
+                print(f"  [干涉] {name}: 布尔运算失败，无法判定")
+                issues.append({'severity': 'WARN', 'check': 'interference',
+                               'msg': f"{name} 干涉检查失败（布尔运算未完成），请人工确认"})
+                continue
             checks[f'interfere_{name}'] = round(v, 3)
             print(f"  [干涉] {name}: Common = {v:.3f} mm³"
                   + ("  OK" if v <= self.interfere_tol else "  ✗ 干涉!"))
@@ -390,6 +500,11 @@ class FitChecker:
     def _run_gap_check(product, base_p, protrusion, cavity, gap_tol,
                        sample_cap, issues, checks, gaps, t0):
         """产品表面点采样：每个点必须被【型腔 或 凸模基座 或 凸起】任一覆盖。"""
+        # P9：预建距离索引（一次性枚举 SOLID + bbox + 内含分类器），
+        # 避免每个采样点重复枚举 SOLID / 构造 vertex / 无预筛的开销
+        idx_cav = _SolidDistIndex(cavity)
+        idx_base = _SolidDistIndex(base_p)
+        idx_pro = _SolidDistIndex(protrusion) if protrusion is not None else None
         n_pts = 0
         exp = TopExp_Explorer(product, TopAbs_FACE)
         fi = 0
@@ -399,15 +514,15 @@ class FitChecker:
             for p in pts:
                 n_pts += 1
                 # 先测型腔（产品表面大多贴型腔内壁/处于空腔内 → 距离 0）
-                d_cav = _dist_point_solid(p, cavity)
+                d_cav = _dist_point_solid(p, cavity, index=idx_cav)
                 if d_cav is not None and d_cav <= gap_tol:
                     continue
                 # 型腔未覆盖 → 检查凸模基座底面（覆盖产品顶部）
-                d_base = _dist_point_solid(p, base_p)
+                d_base = _dist_point_solid(p, base_p, index=idx_base)
                 if d_base is not None and d_base <= gap_tol:
                     continue
                 # 再检查凸起（覆盖产品凹坑/凹槽）
-                d_pro = _dist_point_solid(p, protrusion) if protrusion is not None else None
+                d_pro = _dist_point_solid(p, protrusion, index=idx_pro) if protrusion is not None else None
                 if d_pro is not None and d_pro <= gap_tol:
                     continue
                 # 三者均未覆盖 → 间隙

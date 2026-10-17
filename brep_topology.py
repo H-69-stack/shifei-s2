@@ -234,10 +234,15 @@ class BrepTopologyExtractor:
         self._face_outer_edges = defaultdict(list)   # 外边界边
         self._face_inner_edges = defaultdict(list)   # 内孔边
 
-        # _edge_shapes 键为 0 起连续编号 → map.FindIndex(edge) - 1 即 eid
+        # _edge_shapes 键为 0 起连续编号，但同一 TShape 可能被 explorer
+        # 多次访问（不同父线框/取向）→ map 会合并重复项，位置≠eid。
+        # Add 返回 1 起始索引：新条目追加时记录 position→eid 对照表。
         edge_map = TopTools_IndexedMapOfShape()
+        eid_by_pos = []
         for eid, known_edge in self._edge_shapes.items():
-            edge_map.Add(known_edge)
+            idx = edge_map.Add(known_edge)
+            if idx == len(eid_by_pos) + 1:
+                eid_by_pos.append(eid)
 
         for fid, face in self._face_shapes.items():
             # 获取外边界线框
@@ -250,8 +255,9 @@ class BrepTopologyExtractor:
                 while edge_exp.More():
                     edge = TopoDS.Edge_s(edge_exp.Current())
                     # O(1) 哈希定位（IsSame 语义：忽略取向，同 TShape 即同边）
-                    eid = edge_map.FindIndex(edge) - 1
-                    if eid >= 0:
+                    pos = edge_map.FindIndex(edge)
+                    if pos > 0:
+                        eid = eid_by_pos[pos - 1]
                         if fid not in self._edge_to_faces[eid]:
                             self._edge_to_faces[eid].append(fid)
                         if eid not in self._face_to_edges[fid]:

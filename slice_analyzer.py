@@ -6,6 +6,7 @@ SliceAnalyzer — 网格切片法毛料计算引擎
 """
 
 import math
+import heapq
 
 
 # ── 向量工具 ──
@@ -167,6 +168,24 @@ class MeshSlicer:
         u_axis, v_axis = self._build_ortho_basis(self.direction)
 
         # 3. 对每个切片平面求交
+        # P1：三角形沿 direction 的投影区间预过滤。
+        # 原实现每个切片平面对【全部三角形】重做求交
+        # （50 片 × 50 万三角形 = 2500 万次纯 Python 调用）。
+        # 这里预先算好每个三角形的 [tmin, tmax]，用扫描线 + 小顶堆
+        # 维护"跨越当前 t"的活跃集，每片只测真正可能相交的三角形
+        # （典型仅数百个）。收集后按三角形原始索引排序，
+        # 保证 _chain_segments 的输入顺序与原实现完全一致。
+        tri_t = []
+        for i0, i1, i2 in self._triangles:
+            ta = _vec_dot(self._vertices[i0], self.direction)
+            tb = _vec_dot(self._vertices[i1], self.direction)
+            tc = _vec_dot(self._vertices[i2], self.direction)
+            tri_t.append((min(ta, tb, tc), max(ta, tb, tc)))
+        order = sorted(range(len(tri_t)), key=lambda i: tri_t[i][0])
+        n_tri = len(tri_t)
+        active_heap = []   # (tmax, tri_idx) 小顶堆，按 tmax 淘汰过期三角形
+        ptr = 0
+
         slice_positions = []
         slice_lengths = []
         all_slice_contours_3d = []
@@ -180,9 +199,18 @@ class MeshSlicer:
             t = t_min + si * step
             plane_origin = _vec_add(self.origin, _vec_scale(self.direction, t - _vec_dot(self.origin, self.direction)))
 
-            # 收集交线段
+            # 纳入所有 tmin <= t 的三角形；淘汰 tmax < t 的
+            while ptr < n_tri and tri_t[order[ptr]][0] <= t:
+                i = order[ptr]
+                heapq.heappush(active_heap, (tri_t[i][1], i))
+                ptr += 1
+            while active_heap and active_heap[0][0] < t:
+                heapq.heappop(active_heap)
+
+            # 收集交线段（按三角形原始索引排序 → 与原实现同序）
             segments = []
-            for i0, i1, i2 in self._triangles:
+            for i in sorted(j for _, j in active_heap):
+                i0, i1, i2 = self._triangles[i]
                 p0 = self._vertices[i0]
                 p1 = self._vertices[i1]
                 p2 = self._vertices[i2]
@@ -358,6 +386,35 @@ class MeshSlicer:
                     endpoint_map[k] = []
                 endpoint_map[k].append((idx, is_start))
 
+        def _find_candidates(pt):
+            """找 pt 附近未使用的线段端点（B13 修复①）。
+
+            原实现只查【精确量化格】：相距 0.04mm 的两端点可能落入
+            相邻格子而永不匹配 → 轮廓静默断裂。这里查精确格 + 27 邻域，
+            邻域候选必须通过实际距离 ≤ tolerance 校验（邻域格最远可达
+            2 格，必须距离过滤防误连）。返回 (seg_idx, is_start, dist)。
+            """
+            kx, ky, kz = _key(pt)
+            # 1) 精确格：原语义（格内任意两点距离 ≤ 1 格 = tolerance）
+            for seg_idx, is_start in endpoint_map.get((kx, ky, kz), ()):
+                if seg_idx not in used:
+                    yield seg_idx, is_start, _vec_dist(
+                        segments[seg_idx][0] if is_start else segments[seg_idx][1], pt)
+            # 2) 27 邻域（精确格无可用候选时才走，保持常见路径性能）
+            for dx in (0, -1, 1):
+                for dy in (0, -1, 1):
+                    for dz in (0, -1, 1):
+                        if dx == 0 and dy == 0 and dz == 0:
+                            continue
+                        for seg_idx, is_start in endpoint_map.get(
+                                (kx + dx, ky + dy, kz + dz), ()):
+                            if seg_idx in used:
+                                continue
+                            pt2 = segments[seg_idx][0] if is_start else segments[seg_idx][1]
+                            d = _vec_dist(pt2, pt)
+                            if d <= tolerance:
+                                yield seg_idx, is_start, d
+
         # 贪心链接
         used = set()
         contours = []
@@ -372,31 +429,33 @@ class MeshSlicer:
             current_pt = e
 
             while True:
-                # 找下一个段
-                k = _key(current_pt)
-                candidates = endpoint_map.get(k, [])
-                found = False
-                for seg_idx, is_start in candidates:
-                    if seg_idx in used:
-                        continue
-                    used.add(seg_idx)
-                    seg = segments[seg_idx]
-                    if is_start:
-                        next_pt = seg[1]
-                        contour.append(next_pt)
-                        current_pt = next_pt
-                    else:
-                        next_pt = seg[0]
-                        contour.append(next_pt)
-                        current_pt = next_pt
-                    found = True
+                # 找下一个段（B13 修复②：岔口多候选时按"容差内最近端点"
+                # 择优，而非原实现的任意首选。端点聚类（T 型接头密集
+                # 网格）时，真正的续接端点就是空间上最近的那个；
+                # 距离相同时保持原实现的段序优先语义）
+                best = None
+                best_dist = None
+                for seg_idx, is_start, dist in _find_candidates(current_pt):
+                    if best_dist is None or dist < best_dist:
+                        best_dist = dist
+                        best = (seg_idx, is_start)
+                if best is None:
                     break
+                seg_idx, is_start = best
+                used.add(seg_idx)
+                seg = segments[seg_idx]
+                if is_start:
+                    next_pt = seg[1]
+                    contour.append(next_pt)
+                    current_pt = next_pt
+                else:
+                    next_pt = seg[0]
+                    contour.append(next_pt)
+                    current_pt = next_pt
 
-                if not found:
-                    break
-
-                # 闭环检测
-                if _key(current_pt) == _key(contour[0]):
+                # 闭环检测（B13：按实际距离 ≤ tolerance 判定，
+                # 原实现按量化格相等判定，相邻格的点无法闭环）
+                if _vec_dist(current_pt, contour[0]) <= tolerance:
                     break
 
                 # 安全上限

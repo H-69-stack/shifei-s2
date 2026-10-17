@@ -159,6 +159,10 @@ def fill_holes(shape, tol=1e-3, min_hole_span=2.0, log=print):
         s.Add(p)
     s.Perform()
     res = s.SewedShape()
+    # B15：缝合可能返回空 shape，直接访问 ShapeType() 会崩；与上文 sew() 一致加守卫
+    if res is None or res.IsNull():
+        log("  补孔后缝合失败（返回空），退回原 shape")
+        return shape, rep
     log("  补孔后缝合：类型=%s 自由边=%d 多重边=%d" %
         (res.ShapeType(), s.NbFreeEdges(), s.NbMultipleEdges()))
     return res, rep
@@ -168,6 +172,9 @@ def fill_holes(shape, tol=1e-3, min_hole_span=2.0, log=print):
 # 投影轮廓
 # ---------------------------------------------------------------------------
 CELL = 0.1          # mm / 栅格（仅栅格兜底路线用）
+RASTER_MAX_CELLS = 30_000_000   # P15：栅格单元数上限（bool 掩码 ~30MB，
+                                # 腐蚀还要 int32 累加缓冲）。原实现无上限，
+                                # 1000mm 零件配 cell=0.1 即 10⁸ 格，有 OOM 风险。
 INSET = 0.0         # mm 内缩。★默认 0★：这个量就是上模四周比形变面"少"多少、
                     # 也是下模型腔四周残留立墙的厚度（实测 0.5mm 时残料 7588 mm³）。
                     # 0 时走 HLR 精确轮廓；>0 时退回栅格路线（HLR 的 2D 内缩暂未做）。
@@ -195,7 +202,19 @@ def _mesh_xy(shape, tol=MESH_TOL):
 
 
 def _rasterize(tris, x1, y1, x2, y2, cell):
-    """投影三角形按【单元中心】落格。★全程用毫米，绝不混用栅格索引★"""
+    """投影三角形按【单元中心】落格。★全程用毫米，绝不混用栅格索引★
+
+    P15：W*H 超过 RASTER_MAX_CELLS 时自动放大 cell（兜底路线宁粗勿崩），
+    并告警。原实现无上限：1000mm 零件配 cell=0.1 即 10⁸ 格，掩码加腐蚀
+    缓冲轻松破 GB，有 OOM 风险。
+    """
+    span = max(x2 - x1, y2 - y1)
+    if span > 0:
+        need = span / math.sqrt(RASTER_MAX_CELLS)
+        if cell < need:
+            cell = need
+            print("  [P15] 栅格单元数超上限 %d，cell 自动放大到 %.3fmm"
+                  "（投影跨度 %.0fmm）" % (RASTER_MAX_CELLS, cell, span))
     W = int(math.ceil((x2 - x1) / cell)) + 2
     H = int(math.ceil((y2 - y1) / cell)) + 2
     mask = np.zeros((H, W), dtype=bool)
@@ -367,32 +386,56 @@ def _hlr_outline(shape, rdp_tol=RDP_TOL, defl=0.2, log=print):
         return out
 
     def chain(pieces):
-        """把边链接成闭合环。"""
+        """把边链接成闭合环。
+
+        P15：原实现对每个待接片段都全表扫描所有 pieces（外层还套扩展
+        循环），最坏 O(P³)。改为端点空间哈希（量化格 + 3×3 邻域）后
+        候选查找 O(1) 均摊。择优语义保持不变：片段序号最小者优先，
+        同片段起点匹配优先于终点匹配。
+        """
         def close(a, b, tol=0.05):
             return math.hypot(a[0] - b[0], a[1] - b[1]) <= tol
-        used = [False] * len(pieces)
+        n = len(pieces)
+        used = [False] * n
+        # 量化格尺寸 = tol：容差内两端点的索引格相差至多 1，3×3 邻域必覆盖
+        q = 0.05
+        grid = {}
+        for j, pc in enumerate(pieces):
+            for pt in (pc[0], pc[-1]):
+                key = (int(math.floor(pt[0] / q)), int(math.floor(pt[1] / q)))
+                grid.setdefault(key, []).append(j)
+
+        def find_next(pt):
+            """返回 (j, 是否反向)：未用片段中序号最小、且端点与 pt 接得上者。"""
+            kx = int(math.floor(pt[0] / q))
+            ky = int(math.floor(pt[1] / q))
+            best_j, best_rev = -1, False
+            for dx in (-1, 0, 1):
+                for dy in (-1, 0, 1):
+                    for j in grid.get((kx + dx, ky + dy), ()):
+                        if used[j] or (best_j >= 0 and j >= best_j):
+                            continue
+                        pc = pieces[j]
+                        if close(pt, pc[0]):
+                            best_j, best_rev = j, False
+                        elif close(pt, pc[-1]):
+                            best_j, best_rev = j, True
+            return best_j, best_rev
+
         loops = []
-        for i in range(len(pieces)):
+        for i in range(n):
             if used[i]:
                 continue
             used[i] = True
             cur = list(pieces[i])
-            for _ in range(len(pieces) * 2):
+            for _ in range(n * 2):
                 if len(cur) > 2 and close(cur[-1], cur[0]):
                     break
-                hit, nxt = -1, None
-                for j in range(len(pieces)):
-                    if used[j]:
-                        continue
-                    if close(cur[-1], pieces[j][0]):
-                        hit, nxt = j, pieces[j]
-                        break
-                    if close(cur[-1], pieces[j][-1]):
-                        hit, nxt = j, list(reversed(pieces[j]))
-                        break
+                hit, rev = find_next(cur[-1])
                 if hit < 0:
                     break
                 used[hit] = True
+                nxt = list(reversed(pieces[hit])) if rev else pieces[hit]
                 cur.extend(nxt[1:])
             if len(cur) >= 4 and close(cur[-1], cur[0], 0.1):
                 loops.append(cur)
@@ -451,15 +494,19 @@ def projection_outline(shape, out_png=None, cell=CELL, inset=INSET,
 
     返回 (polygons, info)；polygons[0] 是最外环，其后是内环（洞）。
     ★点表里不含重复的收尾点★（否则 VBA 会画一条零长度线段，草图直接失效）。
-    """
-    import matplotlib
-    matplotlib.use("Agg")
-    import matplotlib.pyplot as plt
 
+    P15：HLR 成功（默认路线）时不再无条件跑全分辨率纯 Python 栅格化——
+    面积校核只用粗栅格估计（≤1024 格/边，像素化误差 <1%，校核容差 15%），
+    全分辨率栅格 + matplotlib 仅在真正退回栅格路线时才做。
+    """
     x1, y1, z1, x2, y2, z2 = geo.bbox(shape)
     tris = _mesh_xy(shape)
-    mask, W, H = _rasterize(tris, x1, y1, x2, y2, cell)
-    proj_area = float(mask.sum()) * cell * cell
+    # 粗栅格面积估计：保持"掩膜并集"语义（投影重叠不重复计数），
+    # 但把格数压到 ≤1024²，HLR 成功时这就是唯一的栅格开销。
+    span = max(x2 - x1, y2 - y1)
+    chk_cell = max(cell, span / 1024.0) if span > 0 else cell
+    mask, W, H = _rasterize(tris, x1, y1, x2, y2, chk_cell)
+    proj_area = float(mask.sum()) * chk_cell * chk_cell
 
     # ★首选 HLR 精确轮廓★
     #   栅格轮廓带台阶折返，会被 SolidWorks 拒绝当拉伸轮廓（实测 YA-1131）。
@@ -495,6 +542,15 @@ def projection_outline(shape, out_png=None, cell=CELL, inset=INSET,
                 % int(abs(1 - ratio) * 100))
         else:
             log("  HLR 没提出闭合环，退回栅格法")
+
+    # ---- 栅格兜底路线（HLR 失败/被弃用，或 inset>0）----
+    # P15：此时才 import matplotlib + 全分辨率栅格化——HLR 成功时这两样
+    # （matplotlib 冷 import ~0.5s + 纯 Python 栅格化）纯属白做。
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    mask, W, H = _rasterize(tris, x1, y1, x2, y2, cell)
+    proj_area = float(mask.sum()) * cell * cell
 
     # ★inset 必须能取 0★
     #   早期为了"让 SW 的成形到曲面盖得住轮廓"写死了 max(1, ...)，

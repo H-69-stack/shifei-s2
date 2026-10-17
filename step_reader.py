@@ -6,6 +6,7 @@ STEP 文件读取与 3D 网格导出模块
 import os
 import json
 import numpy as np
+from array import array as _arr
 from collections import defaultdict
 
 import cadquery as cq
@@ -215,8 +216,8 @@ class StepReader:
 
     def _process_solid(self, solid, idx: int) -> dict:
         """处理单个 Solid，同时提取网格数据和几何特征参数"""
-        all_vertices = []
-        all_triangles = []
+        all_vertices = _arr('d')     # P12：紧凑存储（float64 原值，无精度损失）
+        all_triangles = _arr('i')
         vertex_offset = 0
         face_vertex_offsets = []
         face_params_list = []
@@ -236,7 +237,7 @@ class StepReader:
             if face_data and face_data['vertices']:
                 nv = len(face_data['vertices']) // 3
                 all_vertices.extend(face_data['vertices'])
-                offset_tris = [t + vertex_offset for t in face_data['triangles']]
+                offset_tris = _arr('i', (t + vertex_offset for t in face_data['triangles']))
                 all_triangles.extend(offset_tris)
                 face_vertex_offsets.append({
                     'face_idx': face_idx,
@@ -332,19 +333,20 @@ class StepReader:
             # 变换矩阵
             transform = top_loc.Transformation()
 
-            # 提取顶点
-            vertices = []
+            # 提取顶点（P12：array('d') 紧凑存储，比 Python list 省 ~4x 内存；
+            # 索引/len/extend 语义与 list 一致，下游无需改动）
+            vertices = _arr('d')
             for i in range(1, n_nodes + 1):
                 pnt = triangulation.Node(i)
                 pnt.Transform(transform)
-                vertices.extend([pnt.X(), pnt.Y(), pnt.Z()])
+                vertices.extend((pnt.X(), pnt.Y(), pnt.Z()))
 
-            # 提取三角形
-            tri_indices = []
+            # 提取三角形（int32 索引，2.1B 上限远超任何网格）
+            tri_indices = _arr('i')
             for i in range(1, n_triangles + 1):
                 tri = triangulation.Triangle(i)
                 # OpenCASCADE 使用 1-based 索引
-                tri_indices.extend([tri.Value(1) - 1, tri.Value(3) - 1, tri.Value(2) - 1])  # 翻转法线方向
+                tri_indices.extend((tri.Value(1) - 1, tri.Value(3) - 1, tri.Value(2) - 1))  # 翻转法线方向
 
             # 获取面颜色（简化处理，使用基于曲面类型的默认颜色）
             color = None
@@ -389,8 +391,8 @@ class StepReader:
                 p2 = gp_Pnt(); v2 = gp_Vec()
                 adaptor.D0(first, p1)
                 adaptor.D0(last, p2)
-                return [p1.X(), p1.Y(), p1.Z(),
-                        p2.X(), p2.Y(), p2.Z()]
+                return _arr('d', (p1.X(), p1.Y(), p1.Z(),
+                                  p2.X(), p2.Y(), p2.Z()))
 
             # 曲线（圆/样条等）：按固定细间距采样
             abscissa = GCPnts_UniformAbscissa(adaptor, self.EDGE_SAMPLE_STEP, first, last)
@@ -406,7 +408,7 @@ class StepReader:
                     return []
                 n_sampled = abscissa.NbPoints()
 
-            vertices = []
+            vertices = _arr('d')
             if n_sampled > self.EDGE_MAX_POINTS:
                 # 重采样后仍偏多：均匀抽点，严格不超过上限
                 ratio = (n_sampled - 1) / float(self.EDGE_MAX_POINTS - 1)
@@ -416,14 +418,14 @@ class StepReader:
                     pnt = gp_Pnt()
                     vec = gp_Vec()
                     adaptor.D1(param, pnt, vec)
-                    vertices.extend([pnt.X(), pnt.Y(), pnt.Z()])
+                    vertices.extend((pnt.X(), pnt.Y(), pnt.Z()))
             else:
                 for i in range(1, n_sampled + 1):
                     param = abscissa.Parameter(i)
                     pnt = gp_Pnt()
                     vec = gp_Vec()
                     adaptor.D1(param, pnt, vec)
-                    vertices.extend([pnt.X(), pnt.Y(), pnt.Z()])
+                    vertices.extend((pnt.X(), pnt.Y(), pnt.Z()))
 
             return vertices
 
@@ -722,16 +724,18 @@ class StepReader:
         if not solids_data:
             return {'min': [0, 0, 0], 'max': [0, 0, 0], 'center': [0, 0, 0], 'size': [0, 0, 0]}
 
-        all_verts = []
+        # P12：array('d') 经 np.frombuffer 零拷贝转 (N,3)，
+        # 不再构建 Python list of lists（百万级顶点时省数百 MB）
+        blocks = []
         for solid in solids_data:
             verts = solid['vertices']
-            for i in range(0, len(verts), 3):
-                all_verts.append([verts[i], verts[i+1], verts[i+2]])
+            if len(verts) >= 3:
+                blocks.append(np.frombuffer(verts, dtype=np.float64).reshape(-1, 3))
 
-        if not all_verts:
+        if not blocks:
             return {'min': [0, 0, 0], 'max': [0, 0, 0], 'center': [0, 0, 0], 'size': [0, 0, 0]}
 
-        arr = np.array(all_verts)
+        arr = np.concatenate(blocks) if len(blocks) > 1 else blocks[0]
         bmin = arr.min(axis=0).tolist()
         bmax = arr.max(axis=0).tolist()
         center = ((arr.min(axis=0) + arr.max(axis=0)) / 2).tolist()
@@ -744,21 +748,25 @@ class StepReader:
             'size': [round(v, 4) for v in size],
         }
 
-    def export_mesh_json(self, filepath: str, output_path: str = None) -> str:
+    def export_mesh_json(self, filepath: str, output_path: str = None,
+                         data: dict = None) -> str:
         """
         读取 STEP 文件并导出为 JSON 网格数据
 
         Args:
             filepath: STEP 文件路径
             output_path: 输出 JSON 路径，默认与 STEP 文件同目录
+            data: （可选）已由 read() 解析完成的数据，避免同一 STEP
+                重复导入（__main__ 先 read 再导出时，导入是主导耗时）
 
         Returns:
             输出文件路径
         """
-        data = self.read(filepath)
+        if data is None:
+            data = self.read(filepath)
 
-        # 构建紧凑的导出数据
-        export_data = {
+        # 文件头数据（solids 部分流式逐块写出，不再整体进内存）
+        export_header = {
             'filename': data['filename'],
             'bbox': data['bbox'],
             'stats': {
@@ -767,25 +775,52 @@ class StepReader:
                 'edges': data['total_edges'],
                 'triangles': data['total_triangles'],
             },
-            'solids': [],
         }
-
-        for solid in data['solids']:
-            s = {
-                'name': solid['name'],
-                'vertices': solid['vertices'],
-                'triangles': solid['triangles'],
-                'faces': solid['faces'],
-                'edges': [{'vertices': e['vertices']} for e in solid['edges']],
-            }
-            export_data['solids'].append(s)
 
         if output_path is None:
             base = os.path.splitext(filepath)[0]
             output_path = base + '_mesh.json'
 
+        # P12：流式写出 —— 逐块转换数字数组，峰值内存 = array 本体 +
+        # 单块临时字符串，避免"全量转 list 再整体 dump"的双份峰值
+        # （百万级顶点时可省数百 MB）。输出语义与 json.dump 一致。
+        def _write_number_array(fh, arr, chunk=20000):
+            fh.write('[')
+            n = len(arr)
+            for start in range(0, n, chunk):
+                if start:
+                    fh.write(',')
+                fh.write(','.join(repr(v) for v in arr[start:start + chunk]))
+            fh.write(']')
+
         with open(output_path, 'w', encoding='utf-8') as f:
-            json.dump(export_data, f, ensure_ascii=False)
+            f.write('{"filename": ')
+            json.dump(export_header['filename'], f, ensure_ascii=False)
+            f.write(', "bbox": ')
+            json.dump(export_header['bbox'], f, ensure_ascii=False)
+            f.write(', "stats": ')
+            json.dump(export_header['stats'], f, ensure_ascii=False)
+            f.write(', "solids": [')
+            for si, solid in enumerate(data['solids']):
+                if si:
+                    f.write(', ')
+                f.write('{"name": ')
+                json.dump(solid['name'], f, ensure_ascii=False)
+                f.write(', "vertices": ')
+                _write_number_array(f, solid['vertices'])
+                f.write(', "triangles": ')
+                _write_number_array(f, solid['triangles'])
+                f.write(', "faces": ')
+                json.dump(solid['faces'], f, ensure_ascii=False)
+                f.write(', "edges": [')
+                for ei, e in enumerate(solid['edges']):
+                    if ei:
+                        f.write(', ')
+                    f.write('{"vertices": ')
+                    _write_number_array(f, e['vertices'])
+                    f.write('}')
+                f.write(']}')
+            f.write(']}')
 
         print(f"[OK] 导出完成: {output_path}")
         print(f"  - Solids: {data['total_solids']}")
@@ -796,7 +831,8 @@ class StepReader:
 
         return output_path
 
-    def export_features_json(self, filepath: str, output_path: str = None) -> str:
+    def export_features_json(self, filepath: str, output_path: str = None,
+                             data: dict = None) -> str:
         """
         读取 STEP 文件并导出工艺特征数据为独立 JSON（不含网格顶点/三角形）
 
@@ -808,11 +844,14 @@ class StepReader:
         Args:
             filepath: STEP 文件路径
             output_path: 输出 JSON 路径，默认与 STEP 文件同目录，后缀 _features.json
+            data: （可选）已由 read() 解析完成的数据，避免同一 STEP
+                重复导入（__main__ 先 read 再导出时，导入是主导耗时）
 
         Returns:
             输出文件路径
         """
-        data = self.read(filepath)
+        if data is None:
+            data = self.read(filepath)
 
         # 构建轻量特征数据（不含大量网格顶点坐标）
         feature_data = {
@@ -1052,7 +1091,7 @@ if __name__ == '__main__':
             print(f"  倒角: {len(feats.get('chamfers', []))} 个")
 
         print(f"\n导出网格 JSON...")
-        reader.export_mesh_json(files[0]['path'])
+        reader.export_mesh_json(files[0]['path'], data=data)
 
         print(f"\n导出特征 JSON...")
-        reader.export_features_json(files[0]['path'])
+        reader.export_features_json(files[0]['path'], data=data)

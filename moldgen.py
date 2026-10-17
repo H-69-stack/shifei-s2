@@ -32,13 +32,20 @@ from moldkit import pipeline, registry, swjobs
 
 def _log_factory(quiet=False, tee=None):
     fh = open(tee, "w", encoding="utf-8") if tee else None
+    state = {'last': 0.0}
 
     def log(s=""):
         if not quiet:
             print(s, flush=True)
         if fh:
             fh.write(str(s) + "\n")
-            fh.flush()
+            # P15：逐行 flush 在热循环里是明显的 syscall 开销（布尔/网格
+            # 循环内逐条打日志时显著拖慢）。改为至多每 2s flush 一次；
+            # 正常退出/异常由调用方 finally 里的 fh.close() 兜底刷盘。
+            now = time.monotonic()
+            if now - state['last'] >= 2.0:
+                fh.flush()
+                state['last'] = now
     return log, fh
 
 

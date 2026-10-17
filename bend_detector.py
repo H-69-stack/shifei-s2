@@ -13,7 +13,13 @@ Step 2: 精准识别折弯模块 -- BendDetector
 
 import os
 import math
+import logging
 from collections import defaultdict
+
+_log = logging.getLogger('bend_detector')
+if not _log.handlers:
+    _log.addHandler(logging.StreamHandler())
+    _log.setLevel(logging.INFO)
 
 
 # ── 工具函数 ──
@@ -92,7 +98,14 @@ class BendDetector:
         self.faces = topology['faces']
         self.edges = topology['edges']
         self.vertices = topology['vertices']
-        self.thickness = topology['thickness'] or 2.0
+        # B14：板厚检测失败时原实现静默默认 2.0mm，直接左右 arc_bend
+        # 的 10×t 判定。默认值保留（无更优信息时），但显式记录
+        # thickness_is_default 供调用方感知，并打 WARNING。
+        _th = topology.get('thickness')
+        self.thickness_is_default = not (_th and _th > 0)
+        self.thickness = float(_th) if not self.thickness_is_default else 2.0
+        if self.thickness_is_default:
+            _log.warning("板厚检测失败，使用默认值 2.0mm（arc_bend 的 10×t 判定基于此默认值）")
         self.classification = topology['classification']
         self.planar_faces = set(self.classification.get('planar_faces', []))
         self.fillet_faces = self.classification.get('fillet_faces', [])
@@ -371,6 +384,9 @@ class BendDetector:
             pa, pb, na, nb, axis_dir, fl_info,
             shared_edges_ab=shared_edges_ab if shared_edges_ab else None
         )
+        if bend_origin is None:
+            _log.warning("折弯 (plane %d <-> %d, fillet %d) 无法确定轴线原点，"
+                         "已记为 None（原实现会静默使用 (0,0,0)）", pa, pb, fl_idx)
 
         # 折弯边：圆角面与两个平面的共享边
         tangent_edges_a = sorted(self._shared_edges_between_faces(pa, fl_idx))
@@ -411,100 +427,107 @@ class BendDetector:
 
         # 构建"参与折弯的面集"：已通过圆角连接到其他面的平面
         fillet_connected_faces = set()
+        # P10：预建两张索引，替代原 O(P²) 平面全组合 +
+        # 每候选再遍历全部圆角面的双重开销：
+        #   1) fillet_bridge_pairs：圆角面桥接的平面对集合（O(1) 查桥接）
+        #   2) pair_edges：共享边的平面对 → 共享边集合（从 _edge_to_faces
+        #      直接枚举，只有真正共享边的平面对才会进入后续过滤）
+        fillet_bridge_pairs = set()
         for fl_info in self.fillet_faces:
-            for p in fl_info.get('adjacent_planes', []):
-                if p in self.planar_faces:
-                    fillet_connected_faces.add(p)
+            planes = [p for p in fl_info.get('adjacent_planes', []) if p in self.planar_faces]
+            for p in planes:
+                fillet_connected_faces.add(p)
+            for i in range(len(planes)):
+                for j in range(i + 1, len(planes)):
+                    fillet_bridge_pairs.add(tuple(sorted((planes[i], planes[j]))))
 
-        for pa in self.planar_faces:
-            for pb in self.planar_faces:
-                if pa >= pb:
-                    continue
-                key = tuple(sorted([pa, pb]))
-                if key in skip_pairs or key in checked:
-                    continue
-                checked.add(key)
+        pair_edges = defaultdict(set)
+        for ei, fset in self._edge_to_faces.items():
+            pls = sorted(f for f in fset if f in self.planar_faces)
+            for i in range(len(pls)):
+                for j in range(i + 1, len(pls)):
+                    pair_edges[(pls[i], pls[j])].add(ei)
 
-                # 必须有共享边
-                shared = self._shared_edges_between_faces(pa, pb)
-                if not shared:
-                    continue
+        # 按 (pa, pb) 排序遍历，保证输出顺序确定（原实现按 set 迭代序，不确定）
+        for pa, pb in sorted(pair_edges):
+            key = (pa, pb)
+            if key in skip_pairs or key in checked:
+                continue
+            checked.add(key)
 
-                # ── 过滤规则 1: 两面必须在同一侧 ──
-                if not self._same_side(pa, pb):
-                    continue
+            # 共享边（来自边→面索引，与 _shared_edges_between_faces 等价）
+            shared = pair_edges[key]
+            if not shared:
+                continue
 
-                # ── 过滤规则 2: 不能是同一面墙的正反面 ──
-                if self._are_thickness_counterparts(pa, pb):
-                    continue
+            # ── 过滤规则 1: 两面必须在同一侧 ──
+            if not self._same_side(pa, pb):
+                continue
 
-                # ── 过滤规则 3: 两个面都必须参与圆角折弯 ──
-                # 理由：如果有一面不参与任何圆角折弯，说明该面不在"折弯网络"中
-                # 它的边很可能是外轮廓边（如 face#6 与各法兰的边），而非真实折弯
-                if pa not in fillet_connected_faces or pb not in fillet_connected_faces:
-                    continue
+            # ── 过滤规则 2: 不能是同一面墙的正反面 ──
+            if self._are_thickness_counterparts(pa, pb):
+                continue
 
-                # ── 过滤规则 4: 共享边必须有至少一条是直线且足够长 ──
-                # 折弯边是直线，太短（< 5mm）的边通常是圆角端盖边而非折弯边
-                has_valid_edge = False
-                for ei in shared:
-                    if ei < len(self.edges):
-                        edge = self.edges[ei]
-                        if edge['curve_type'] == 'Line':
-                            length = edge['curve_params'].get('length', 0)
-                            if length >= 5.0:
-                                has_valid_edge = True
-                                break
-                if not has_valid_edge:
-                    continue
+            # ── 过滤规则 3: 两个面都必须参与圆角折弯 ──
+            # 理由：如果有一面不参与任何圆角折弯，说明该面不在"折弯网络"中
+            # 它的边很可能是外轮廓边（如 face#6 与各法兰的边），而非真实折弯
+            if pa not in fillet_connected_faces or pb not in fillet_connected_faces:
+                continue
 
-                # 法向量
-                na = self._get_face_normal(pa)
-                nb = self._get_face_normal(pb)
-                if na is None or nb is None:
-                    continue
+            # ── 过滤规则 4: 共享边必须有至少一条是直线且足够长 ──
+            # 折弯边是直线，太短（< 5mm）的边通常是圆角端盖边而非折弯边
+            has_valid_edge = False
+            for ei in shared:
+                if ei < len(self.edges):
+                    edge = self.edges[ei]
+                    if edge['curve_type'] == 'Line':
+                        length = edge['curve_params'].get('length', 0)
+                        if length >= 5.0:
+                            has_valid_edge = True
+                            break
+            if not has_valid_edge:
+                continue
 
-                # 角度
-                bend_angle_rad = _vec_angle_between(na, nb)
-                bend_angle_deg = math.degrees(bend_angle_rad)
-                if bend_angle_deg < 0.5:
-                    continue  # 共面
+            # 法向量
+            na = self._get_face_normal(pa)
+            nb = self._get_face_normal(pb)
+            if na is None or nb is None:
+                continue
 
-                # 检查是否有圆角面也连接这两个平面
-                # （如果有，应该已被方法 1 覆盖）
-                has_fillet_bridge = False
-                for fl_info in self.fillet_faces:
-                    fl_planes = set(fl_info.get('adjacent_planes', []))
-                    if pa in fl_planes and pb in fl_planes:
-                        has_fillet_bridge = True
-                        break
+            # 角度
+            bend_angle_rad = _vec_angle_between(na, nb)
+            bend_angle_deg = math.degrees(bend_angle_rad)
+            if bend_angle_deg < 0.5:
+                continue  # 共面
 
-                if has_fillet_bridge:
-                    continue  # 方法 1 已覆盖
+            # 检查是否有圆角面也连接这两个平面
+            # （如果有，应该已被方法 1 覆盖）——P10：O(1) 索引查表
+            if key in fillet_bridge_pairs:
+                continue  # 方法 1 已覆盖
 
-                # 轴线方向 = 共享边的方向
-                axis_dir = self._infer_axis_from_edges(shared)
-                if axis_dir is None:
-                    axis_dir = _vec_normalize(_vec_cross(na, nb))
+            # 轴线方向 = 共享边的方向
+            axis_dir = self._infer_axis_from_edges(shared)
+            if axis_dir is None:
+                axis_dir = _vec_normalize(_vec_cross(na, nb))
 
-                # 原点：取共享边中点
-                origin = self._midpoint_of_edges(shared)
+            # 原点：取共享边中点（B14：无可用顶点时返回 None 而非 (0,0,0)）
+            origin = self._midpoint_of_edges(shared)
 
-                bends.append({
-                    'plane_a': pa,
-                    'plane_b': pb,
-                    'fillet_face': None,
-                    'fillet_surface_type': None,
-                    'bend_axis_origin': origin,
-                    'bend_axis_direction': axis_dir,
-                    'bend_angle_deg': round(bend_angle_deg, 2),
-                    'bend_angle_rad': round(bend_angle_rad, 6),
-                    'bend_radius': None,  # 无圆角 -> 尖角折弯，R = 0 或 K*t
-                    'tangent_edges_a': [],
-                    'tangent_edges_b': [],
-                    'shared_edges_between_planes': sorted(shared),
-                    'detection_method': 'direct_edge',
-                })
+            bends.append({
+                'plane_a': pa,
+                'plane_b': pb,
+                'fillet_face': None,
+                'fillet_surface_type': None,
+                'bend_axis_origin': origin,
+                'bend_axis_direction': axis_dir,
+                'bend_angle_deg': round(bend_angle_deg, 2),
+                'bend_angle_rad': round(bend_angle_rad, 6),
+                'bend_radius': None,  # 无圆角 -> 尖角折弯，R = 0 或 K*t
+                'tangent_edges_a': [],
+                'tangent_edges_b': [],
+                'shared_edges_between_planes': sorted(shared),
+                'detection_method': 'direct_edge',
+            })
 
         return bends
 
@@ -582,6 +605,10 @@ class BendDetector:
             if ei not in bend_edges and len(adj_faces) == 2:
                 # 检查两个面是否都是平面
                 f0, f1 = adj_faces[0], adj_faces[1]
+                # B14：同类代码（597/639 行）有越界 guard，这里补上，
+                # 避免边索引与面列表不一致时直接 IndexError
+                if f0 >= len(self.faces) or f1 >= len(self.faces):
+                    continue
                 f0_type = self.faces[f0]['surface_type']
                 f1_type = self.faces[f1]['surface_type']
 
@@ -693,7 +720,7 @@ class BendDetector:
                     points.append(_vec_midpoint(p1, p2))
 
         if not points:
-            return (0.0, 0.0, 0.0)
+            return None  # B14：不再伪造 (0,0,0)，无可用顶点时明确返回 None
 
         n = len(points)
         return tuple(sum(p[i] for p in points) / n for i in range(3))
@@ -737,14 +764,15 @@ class BendDetector:
         # ── 优先级 2：平面交线计算 ──
         intersection_dir = _vec_normalize(_vec_cross(na, nb))
         if _vec_length(intersection_dir) < 1e-6:
-            # 平面平行，无交线 -> 回退
-            return fl_info.get('axis_origin', (0.0, 0.0, 0.0))
+            # 平面平行，无交线 -> 回退（B14：无轴原点信息时返回 None，
+            # 不再伪造 (0,0,0) 让错误无感知）
+            return fl_info.get('axis_origin')
 
         oa = self._get_face_origin(pa)
         ob = self._get_face_origin(pb)
 
         if oa is None or ob is None:
-            return fl_info.get('axis_origin', (0.0, 0.0, 0.0))
+            return fl_info.get('axis_origin')
 
         da = _vec_dot(na, oa)
         db = _vec_dot(nb, ob)
@@ -752,7 +780,7 @@ class BendDetector:
         denom = 1.0 - dot_nab * dot_nab
 
         if abs(denom) < 1e-12:
-            return fl_info.get('axis_origin', (0.0, 0.0, 0.0))
+            return fl_info.get('axis_origin')
 
         alpha = (da - db * dot_nab) / denom
         beta = (db - da * dot_nab) / denom
@@ -848,7 +876,7 @@ if __name__ == '__main__':
             print(f"  Angle:        {b['bend_angle_deg']} deg")
             print(f"  Radius:       {b['bend_radius']} mm")
             print(f"  Axis dir:     {b['bend_axis_direction']}")
-            print(f"  Axis origin:  {b['bend_axis_origin']}")
+            print(f"  Axis origin:  {b['bend_axis_origin'] if b['bend_axis_origin'] is not None else 'N/A'}")
             print(f"  Tangent A:    {b['tangent_edges_a']}")
             print(f"  Tangent B:    {b['tangent_edges_b']}")
             print(f"  Shared(AB):   {b['shared_edges_between_planes']}")

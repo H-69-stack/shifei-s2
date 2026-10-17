@@ -119,7 +119,9 @@ class MirrorGenerator:
         trsf = gp_Trsf()
         trsf.SetMirror(gp_Ax2(gp_Pnt(ox, oy, oz), gp_Dir(nx, ny, nz)))
 
-        transformer = BRepBuilderAPI_Transform(self._shape, trsf)
+        # B10：Copy=True —— 默认 Copy=False 会原地修改 self._shape 的底层
+        # 几何，同一实例连续 mirror/rotate 时第二次作用于已变换的 shape。
+        transformer = BRepBuilderAPI_Transform(self._shape, trsf, True)
         transformer.Build()
         return transformer.Shape()
 
@@ -221,7 +223,9 @@ class MirrorGenerator:
             gp_Ax1(gp_Pnt(ox, oy, oz), gp_Dir(dx, dy, dz)), radians
         )
 
-        transformer = BRepBuilderAPI_Transform(self._shape, trsf)
+        # B10：Copy=True —— 默认 Copy=False 会原地修改 self._shape 的底层
+        # 几何，同一实例连续 mirror/rotate 时第二次作用于已变换的 shape。
+        transformer = BRepBuilderAPI_Transform(self._shape, trsf, True)
         transformer.Build()
         return transformer.Shape()
 

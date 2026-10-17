@@ -142,7 +142,20 @@ def _has_geom(shape):
 
 
 def _common_volume(a, b):
-    """两实体交集体积（≈0 表示无干涉）。失败返回 0.0。"""
+    """两实体交集体积（≈0 表示无干涉）。
+
+    B6：布尔失败/未完成时返回 None（与"交集体积≈0"明确区分），
+    由调用方记 WARN 按未知处理，不再静默按 0 放过。
+
+    前置守卫：任一参数为 None/空/不含任何 SOLID 时无法判定，同样返回
+    None（空 compound 经 OCC 会"成功"返回空集体积 0，会被误判为"已确认
+    无重叠"——这里显式拦截，避免静默漏报）。
+    """
+    if a is None or b is None or a.IsNull() or b.IsNull():
+        return None
+    if not TopExp_Explorer(a, TopAbs_SOLID).More() \
+            or not TopExp_Explorer(b, TopAbs_SOLID).More():
+        return None
     try:
         c = BRepAlgoAPI_Common(a, b)
         c.SetRunParallel(False)
@@ -152,7 +165,7 @@ def _common_volume(a, b):
             return _volume(c.Shape())
     except Exception:
         pass
-    return 0.0
+    return None
 
 
 def _fuse(a, b, label="Fuse", fuzz=1e-4):
@@ -254,25 +267,99 @@ def _point_inside(shape, pnt, tol=1e-6):
     return False
 
 
-def _dist_point_solid(pnt, solid):
-    """点到实体的最近距离（点在其内部/表面为 0）。失败返回 None。
-    遍历实体内的所有 SOLID，返回最小的最近距离（compound 需全覆盖）。"""
-    best = None
-    try:
-        exp = TopExp_Explorer(solid, TopAbs_SOLID)
-        if not exp.More():
+def _bbox_point_gap(bb, pnt):
+    """包围盒 (x1,y1,z1,x2,y2,z2) 到点的最短距离（内部/表面上为 0）。"""
+    x1, y1, z1, x2, y2, z2 = bb
+    d2 = 0.0
+    for lo, hi, c in ((x1, x2, pnt.X()), (y1, y2, pnt.Y()), (z1, z2, pnt.Z())):
+        if c < lo:
+            d = lo - c
+        elif c > hi:
+            d = c - hi
+        else:
+            d = 0.0
+        d2 += d * d
+    return math.sqrt(d2)
+
+
+class _SolidDistIndex:
+    """P9：点到实体距离查询索引。
+
+    原实现每个采样点都对 compound 内每个 SOLID 各做一次
+    BRepExtrema_DistShapeShape，循环内还重复构造 vertex、无任何
+    预筛。这里预枚举 SOLID/SHELL + 包围盒 + SolidClassifier：
+      - 内含短路：分类器命中 TopAbs_IN 即距离 0（远比 BVH 距离快）
+      - bbox 下界粗排：下界已不优于当前最优时跳过精确距离计算
+      - vertex 每个查询只构造一次
+    距离语义与原实现一致（内部/表面为 0；返回最小最近距离）。
+    """
+    __slots__ = ('entries', '_shape')
+
+    def __init__(self, shape):
+        self._shape = shape
+        self.entries = []
+        if shape is None:
+            return
+        for tp in (TopAbs_SOLID, TopAbs_SHELL):
+            exp = TopExp_Explorer(shape, tp)
+            while exp.More():
+                shp = exp.Current()
+                bb = None
+                try:
+                    b = Bnd_Box()
+                    BRepBndLib.AddOptimal_s(shp, b)
+                    if not b.IsVoid():
+                        bb = b.Get()
+                except Exception:
+                    bb = None
+                clsf = None
+                if tp == TopAbs_SOLID:
+                    try:
+                        clsf = BRepClass3d_SolidClassifier(shp)
+                    except Exception:
+                        clsf = None
+                self.entries.append((shp, bb, clsf))
+                exp.Next()
+
+    def dist(self, pnt):
+        """点到实体最近距离（内部/表面为 0）。无几何/失败返回 None。"""
+        if not self.entries:
             return None
-        while exp.More():
-            v = TopoDS.Vertex_s(BRepBuilderAPI_MakeVertex(pnt).Vertex())
-            d = BRepExtrema_DistShapeShape(exp.Current(), v)
-            d.Perform()
-            if d.IsDone():
-                val = d.Value()
-                best = val if best is None else min(best, val)
-            exp.Next()
-    except Exception:
-        pass
-    return best
+        best = None
+        vertex = None
+        for shp, bb, clsf in self.entries:
+            if clsf is not None:
+                try:
+                    clsf.Perform(pnt, 1e-6)
+                    if clsf.State() == TopAbs_IN:
+                        return 0.0
+                except Exception:
+                    pass
+            if bb is not None and best is not None and _bbox_point_gap(bb, pnt) >= best:
+                continue
+            try:
+                if vertex is None:
+                    vertex = BRepBuilderAPI_MakeVertex(pnt).Vertex()
+                d = BRepExtrema_DistShapeShape(shp, vertex)
+                d.Perform()
+                if d.IsDone():
+                    val = d.Value()
+                    best = val if best is None else min(best, val)
+            except Exception:
+                pass
+        return best
+
+
+def _dist_point_solid(pnt, solid, index=None):
+    """点到实体的最近距离（点在其内部/表面为 0）。失败返回 None。
+    遍历实体内的所有 SOLID，返回最小的最近距离（compound 需全覆盖）。
+
+    P9：传入预建的 _SolidDistIndex 可避免每个采样点重复枚举
+    SOLID / 构造 vertex / 无预筛的开销；不传则临时构建（兼容旧调用）。
+    """
+    if index is None:
+        index = _SolidDistIndex(solid)
+    return index.dist(pnt)
 
 
 def _sample_face_points(face, cap=12):
@@ -475,6 +562,13 @@ def build_assembly(punch_path, cavity_path, product_path=None,
                        ('下模<->产品', cavity_shape, product),
                        ('上模<->下模', punch_shape, cavity_shape)]:
         v = _common_volume(a, b)
+        if v is None:
+            # B6：布尔失败不再伪装成"无重叠"——按未知处理并告警
+            checks['interfere_' + name] = None
+            print("  [干涉] %s: 布尔运算失败，无法判定" % name)
+            issues.append({'severity': 'WARN', 'check': 'interference',
+                           'msg': "%s 干涉检查失败（布尔运算未完成），请人工确认" % name})
+            continue
         checks['interfere_' + name] = round(v, 3)
         print("  [干涉] %s: Common=%.3f mm^3 %s"
               % (name, v, "OK" if v <= interfere_tol else "X 干涉!"))
@@ -485,6 +579,10 @@ def build_assembly(punch_path, cavity_path, product_path=None,
 
     # ---- 6. 间隙自检（产品表面采样点到 上模/下模 最近距离）----
     print("\n  产品表面贴合采样（gap_tol=%.2f mm）..." % gap_tol)
+    # P9：预建距离索引（一次性枚举 SOLID + bbox + 内含分类器），
+    # 避免每个采样点重复枚举 SOLID / 构造 vertex / 无预筛的开销
+    idx_punch = _SolidDistIndex(punch_shape)
+    idx_cavity = _SolidDistIndex(cavity_shape)
     gap_pts = 0
     n_pts = 0
     max_gap = 0.0
@@ -492,8 +590,8 @@ def build_assembly(punch_path, cavity_path, product_path=None,
     while e.More():
         for p in _sample_face_points(e.Current(), cap=12):
             n_pts += 1
-            d_p = _dist_point_solid(p, punch_shape)
-            d_c = _dist_point_solid(p, cavity_shape)
+            d_p = _dist_point_solid(p, punch_shape, index=idx_punch)
+            d_c = _dist_point_solid(p, cavity_shape, index=idx_cavity)
             d_best = None
             for d in (d_p, d_c):
                 if d is not None:

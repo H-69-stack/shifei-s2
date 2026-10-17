@@ -6,14 +6,22 @@
 import os
 import sys
 import math
+import re
+import datetime
 
 try:
-    from OCC.Core.BRepPrimAPI import BRepPrimAPI_MakeBox
-    from OCC.Core.STEPControl import STEPControl_Writer, STEPControl_AsIs
-    from OCC.Core.IFSelect import IFSelect_RetDone
+    # B15：统一使用项目既有的 OCP 绑定（与 moldkit / fit_checker 等一致），
+    # 避免 OCC.Core / OCP 双绑定分叉导致行为差异。
+    from OCP.BRepPrimAPI import BRepPrimAPI_MakeBox
+    from OCP.STEPControl import STEPControl_Writer, STEPControl_AsIs
+    from OCP.IFSelect import IFSelect_RetDone
     OCC_AVAILABLE = True
 except ImportError:
     OCC_AVAILABLE = False
+
+# STEP 方向矢量（LINE 引用的 VECTOR）模长：应为单位模长 1.0，
+# 原写死 1000 既不符合方向矢量语义也无必要。
+STEP_VECTOR_MAGNITUDE = 1.0
 
 import tkinter as tk
 from tkinter import ttk, messagebox, filedialog
@@ -116,7 +124,8 @@ class StepBoxWriter:
     def _build(self, filepath: str) -> str:
         L, W, H = self.L, self.W, self.H
         name = f'BOX_{L:.1f}x{W:.1f}x{H:.1f}'
-        dt = '2026-07-25T15:00:00+08:00'
+        # B15：STEP 时间戳用当前本地时间，不再写死
+        dt = datetime.datetime.now().astimezone().isoformat(timespec='seconds')
 
         ctx_id = self._nid(); apd_id = self._nid(); prd_id = self._nid()
         pdf_id = self._nid(); pdd_id = self._nid(); pdc_id = self._nid()
@@ -144,7 +153,7 @@ class StepBoxWriter:
         vec_ids = {}
         for d in ((1,0,0),(0,1,0),(0,0,1),(-1,0,0),(0,-1,0),(0,0,-1)):
             nid = self._nid(); vec_ids[d] = nid
-            self._put(f"#{nid}=VECTOR('',#{dir_ids[d]},1000.);")
+            self._put(f"#{nid}=VECTOR('',#{dir_ids[d]},{STEP_VECTOR_MAGNITUDE}.);")
 
         for s, e, d in [
             ((0,0,0),(L,0,0),(1,0,0)),((L,0,0),(L,W,0),(0,1,0)),
@@ -250,7 +259,8 @@ class BoxGeneratorApp:
         self.style.configure('TButton', font=('Microsoft YaHei', 10), padding=8)
         self.style.configure('TEntry', font=('Microsoft YaHei', 11), padding=6)
         self.default_output_dir = os.path.join(os.path.expanduser("~"), "Desktop", "BoxModels")
-        os.makedirs(self.default_output_dir, exist_ok=True)
+        # B15：不在启动时建目录——桌面被重定向或无写权限时启动即崩；
+        #      目录在用户实际点击生成时（_generate）按所选路径创建。
         self._build_ui()
 
     def _build_ui(self):
@@ -302,6 +312,17 @@ class BoxGeneratorApp:
         d = filedialog.askdirectory(initialdir=self.output_var.get(), title="选择保存目录")
         if d: self.output_var.set(d)
 
+    @staticmethod
+    def _sanitize_filename(name):
+        """B15：净化用户文件名，防止路径穿越/非法字符导致写出预期目录之外
+        或写入失败。仅保留安全字符，剥离任何路径成分与首尾点。"""
+        name = os.path.basename(name)            # 去掉任何目录成分
+        name = re.sub(r'[^A-Za-z0-9_.\-]', '_', name)  # 非法字符 → 下划线
+        name = name.strip('. ').strip()
+        if not name:
+            name = "Box"
+        return name[:120]
+
     def _generate(self):
         try:
             L = float(self.length_var.get()); W = float(self.width_var.get()); H = float(self.height_var.get())
@@ -311,7 +332,8 @@ class BoxGeneratorApp:
             messagebox.showerror("输入错误", "长、宽、高必须大于 0"); return
         out_dir = self.output_var.get().strip() or self.default_output_dir
         self.output_var.set(out_dir); os.makedirs(out_dir, exist_ok=True)
-        fname = self.filename_var.get().strip() or f"Box_{L:.0f}x{W:.0f}x{H:.0f}"
+        fname = self._sanitize_filename(
+            self.filename_var.get().strip() or f"Box_{L:.0f}x{W:.0f}x{H:.0f}")
         self.filename_var.set(fname)
         stp_path = os.path.join(out_dir, f"{fname}.stp")
         self.status_var.set("⏳ 正在生成...")

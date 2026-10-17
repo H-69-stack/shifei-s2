@@ -29,6 +29,7 @@ from OCP.Bnd import Bnd_Box
 from OCP.gp import gp_Pnt, gp_Dir, gp_Ax2
 from OCP.BRepPrimAPI import BRepPrimAPI_MakeCylinder
 from OCP.BRepAlgoAPI import BRepAlgoAPI_Fuse
+from OCP.TopTools import TopTools_ListOfShape
 from OCP.BRepGProp import BRepGProp
 from OCP.GProp import GProp_GProps
 from OCP.BRepCheck import BRepCheck_Analyzer
@@ -65,15 +66,21 @@ class HoleFiller:
         if not shapes:
             raise ValueError("STEP 文件未读取到几何体")
         solid = None
+        n_solids = 0
         for shp in shapes:
             exp = TopExp_Explorer(shp.wrapped, TopAbs_SOLID)
             while exp.More():
-                solid = TopoDS.Solid_s(exp.Current())
-                break
-            if solid:
-                break
+                n_solids += 1
+                if solid is None:
+                    solid = TopoDS.Solid_s(exp.Current())
+                exp.Next()
         if solid is None:
             raise ValueError("未找到 Solid 实体")
+        # B4：多实体（焊接件/组件）时其余实体曾被静默丢失。
+        # 补齐流程按单实体设计，这里显式告警而非静默继续。
+        if n_solids > 1:
+            print(f"[警告] 文件含 {n_solids} 个 Solid，孔洞补齐仅作用于第一个；"
+                  f"多实体产品请先合并或分别处理")
         self._solid = solid
         self._shape = solid
         return solid
@@ -132,6 +139,10 @@ class HoleFiller:
         candidates = [c for c in raw if c['u_span'] >= (2 * math.pi - self.FULL_TOL)]
 
         # 去重：同一孔壁（同轴线、同半径、t 区间重叠）只保留一个
+        # B3：原实现只比较 radius/t_min/t_max/axis_dir，不比较轴线【位置】，
+        # 两块板上同轴、等半径、t 区间相同的平行孔阵被判为重复，只保留
+        # 第一个孔 → 孔阵系统性漏填。加入轴线间距判据（两轴线间距
+        # < 1e-3 才算同一孔）。
         holes = []
         for c in sorted(candidates, key=lambda x: (-x['radius'], x['t_min'])):
             dup = False
@@ -139,7 +150,8 @@ class HoleFiller:
                 if (abs(h['radius'] - c['radius']) < 1e-3 and
                         abs(h['t_min'] - c['t_min']) < 1e-3 and
                         abs(h['t_max'] - c['t_max']) < 1e-3 and
-                        _dir_equal(h['axis_dir'], c['axis_dir'])):
+                        _dir_equal(h['axis_dir'], c['axis_dir']) and
+                        _axis_gap(h['loc'], c['loc'], c['axis_dir']) < 1e-3):
                     dup = True
                     break
             if not dup:
@@ -171,6 +183,31 @@ class HoleFiller:
             if not f.IsDone():
                 return None
             return f.Shape()
+        except Exception:
+            return None
+
+    def _fuse_many(self, base, plugs):
+        """P13：base 与整批 plug 一次性布尔融合。
+
+        原实现每孔都对持续增大的实体做一次完整布尔，1000 孔场景
+        平方级增长。plug 互不重叠（同轴孔已去重），可批量融合；
+        单批失败由调用方退化为批内逐孔 fuse。
+        """
+        try:
+            op = BRepAlgoAPI_Fuse()
+            args = TopTools_ListOfShape()
+            args.Append(base)
+            op.SetArguments(args)
+            tools = TopTools_ListOfShape()
+            for p in plugs:
+                tools.Append(p)
+            op.SetTools(tools)
+            op.SetRunParallel(False)
+            op.SetFuzzyValue(1e-5)
+            op.Build()
+            if not op.IsDone():
+                return None
+            return op.Shape()
         except Exception:
             return None
 
@@ -242,15 +279,41 @@ class HoleFiller:
 
         result_shape = self._shape
         filled = 0
+        skipped = 0
+        # P13：先构造全部 plug，再分批批量融合（每批一次布尔），
+        # 避免"每孔对持续增大的实体做完整布尔"的平方级开销。
+        plugs = []
         for info in holes:
             plug = self._make_plug(info)
-            if plug is None:
+            if plug is not None:
+                plugs.append(plug)
+
+        BATCH = 64
+        i = 0
+        while i < len(plugs):
+            batch = plugs[i:i + BATCH]
+            i += BATCH
+            if len(batch) == 1:
+                merged = self._fuse(result_shape, batch[0])
+                if merged is not None and self._is_valid(merged):
+                    result_shape = merged
+                    filled += 1
+                else:
+                    skipped += 1
                 continue
-            merged = self._fuse(result_shape, plug)
-            if merged is None or not self._is_valid(merged):
-                continue
-            result_shape = merged
-            filled += 1
+            merged = self._fuse_many(result_shape, batch)
+            if merged is not None and self._is_valid(merged):
+                result_shape = merged
+                filled += len(batch)
+            else:
+                # 批量失败 → 该批内退化为逐孔 fuse（保持原容错语义）
+                for plug in batch:
+                    m = self._fuse(result_shape, plug)
+                    if m is not None and self._is_valid(m):
+                        result_shape = m
+                        filled += 1
+                    else:
+                        skipped += 1
 
         out_path = os.path.join(output_dir, f"{name}_HOLE_FILLED.stp")
         w = STEPControl_Writer()
@@ -285,6 +348,18 @@ def _dir_equal(a, b, tol=1e-3):
     return abs(abs(dot) - 1.0) < tol
 
 
+def _axis_gap(loc_a, loc_b, axis_dir):
+    """两平行轴线之间的最短距离（loc_a/loc_b 为轴线上点）。
+
+    B3 配套：向量差投影到轴线方向后剩余分量即轴间距。
+    """
+    dx, dy, dz = (loc_a[0] - loc_b[0], loc_a[1] - loc_b[1], loc_a[2] - loc_b[2])
+    d = axis_dir
+    t = dx * d[0] + dy * d[1] + dz * d[2]
+    px, py, pz = dx - t * d[0], dy - t * d[1], dz - t * d[2]
+    return math.sqrt(px * px + py * py + pz * pz)
+
+
 def _force_utf8():
     try:
         import sys
@@ -310,10 +385,14 @@ if __name__ == '__main__':
 
     hf = HoleFiller()
     r = hf.fill(test_file, output_dir=out_dir)
+    # B15：_volume 失败返回 None 时原 f"{None:.0f}" 直接崩，这里显式处理
+    vb = r['volume_before']
+    va = r['volume_after']
     print(f"\n[结果] 孔洞补齐: {r['output_path']}")
     print(f"  识别孔数: {r['hole_count']}  成功补齐: {r['filled_count']}"
           f"  跳过: {r['skipped_count']}")
-    print(f"  体积: {r['volume_before']:.0f} -> {r['volume_after']:.0f} mm³")
+    print(f"  体积: {vb:.0f} -> {va:.0f} mm³" if (vb is not None and va is not None)
+          else f"  体积: {vb} -> {va} mm³（体积计算失败）")
     print(f"  有效: {r['valid']}  包围盒: {r['bbox']['size']}")
     for h in r['holes']:
         print(f"    Φ{h['diameter']}mm  轴={h['axis']}  t=[{h['t_min']},{h['t_max']}]")

@@ -39,6 +39,12 @@ LOG = os.path.join(os.environ.get("TEMP", r"C:\Windows\Temp"), "moldsv_log.txt")
 _JOB_LOCK = threading.Lock()
 _INSTALL_LOCK = threading.Lock()
 
+# B15：RunMacro2 阻塞式 COM 调用超时阈值（秒）。COM 无法从另一线程安全中断
+#   （会破坏 STA 单元），所以这里只能"观察+标注"，不能真正 kill SW。一旦调用
+#   超过此阈值，watchdog 会在日志/返回结果里显式标出"超阈值运行"，避免调用方
+#   在毫无信号的情况下永久 `running`。
+RUNMACRO2_WATCHDOG_S = 120
+
 DEFAULT_SWP = os.path.join(ROOT, "mold_method3.swp")
 DEFAULT_MODULE = "mold_method31"
 DEFAULT_ENTRY = "RunMoldSV"
@@ -461,13 +467,14 @@ class SwEngine:
         # ★卡死 watchdog★：RunMacro2 是阻塞式 COM 调用，SW 卡死时线程会
         #   永久挂住（daemon 线程 + 任务状态永远 running）。无法安全中断
         #   COM 调用，但至少让用户看到卡了多久，而不是无声等待。
-        _stuck = {"flag": False}
+        _stuck = {"flag": False, "fired_at": None}
 
         def _watchdog():
-            time.sleep(120)
+            time.sleep(RUNMACRO2_WATCHDOG_S)
             _stuck["flag"] = True
-            print("  [run_job] ⚠ RunMacro2 已超过 120s 未返回，SolidWorks 可能卡死，"
-                  "建议检查 SW 界面")
+            _stuck["fired_at"] = time.time()
+            print("  [run_job] ⚠ RunMacro2 已超过 %ds 未返回，SolidWorks 可能卡死，"
+                  "建议检查 SW 界面（无法从外部中断 COM 调用）" % RUNMACRO2_WATCHDOG_S)
 
         wd = threading.Thread(target=_watchdog, daemon=True)
         wd.start()
@@ -478,6 +485,13 @@ class SwEngine:
             if not quiet:
                 print("  RunMacro2 异常:", repr(e))
             raw = "异常 %r" % (e,)
+
+        # B15：若调用过程中已触发 watchdog，在返回结果里明确标注"超阈值运行"，
+        #   让调用方拿到可感知信号（而非永远停在 running 无日志）。
+        if _stuck["flag"]:
+            overrun = time.time() - _stuck["fired_at"] if _stuck["fired_at"] else 0.0
+            raw += " [WARN: 超 %ds 阈值运行, 卡死时长≈%.1fs]" % (
+                RUNMACRO2_WATCHDOG_S, overrun)
 
         time.sleep(wait)
         res = open(RES, encoding="mbcs", errors="replace").read().strip() if os.path.exists(RES) else ""
