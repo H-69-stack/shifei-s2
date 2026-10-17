@@ -1,0 +1,1885 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>3D 模型查看与测量系统</title>
+    <script type="importmap">
+        {
+            "imports": {
+                "three": "https://unpkg.com/three@0.160.0/build/three.module.js",
+                "three/addons/": "https://unpkg.com/three@0.160.0/examples/jsm/"
+            }
+        }
+    </script>
+    <style>
+        :root {
+            --primary:#4f8cf7; --primary-dark:#3a6fd8; --primary-bg:#eaf1ff;
+            --bg:#f0f2f5; --surface:#fff; --border:#dde1e7; --text:#1b2534; --text2:#68748a; --text3:#9aa7ba;
+            --shadow:0 2px 10px rgba(0,0,0,0.07); --radius:8px;
+        }
+        * {margin:0;padding:0;box-sizing:border-box}
+        body{font-family:'Segoe UI','Microsoft YaHei',system-ui,sans-serif;background:var(--bg);height:100vh;overflow:hidden;color:var(--text)}
+        /* ===== Header ===== */
+        .header{height:50px;background:var(--surface);border-bottom:1px solid var(--border);display:flex;align-items:center;padding:0 12px;gap:10px;flex-shrink:0;z-index:50}
+        .logo{width:30px;height:30px;border-radius:7px;background:linear-gradient(135deg,#4f8cf7,#6c5ce7);color:#fff;display:flex;align-items:center;justify-content:center;font-weight:800;font-size:14px}
+        .logo-txt{font-weight:700;font-size:15px}
+        .logo-sub{font-size:11px;color:var(--text3);padding-left:8px;border-left:1px solid var(--border)}
+        .spacer{flex:1}
+        .header-actions{display:flex;gap:6px}
+        .ha-btn{padding:7px 12px;border:1px solid var(--border);background:var(--bg);border-radius:7px;cursor:pointer;font-size:12.5px;color:var(--text2);transition:.15s}
+        .ha-btn:hover{border-color:var(--primary);color:var(--primary);background:var(--primary-bg)}
+        .ha-btn.active{background:var(--primary);color:#fff;border-color:var(--primary)}
+        .auto-clean-toggle{display:flex;align-items:center;gap:5px;padding:7px 10px;border:1px solid var(--border);background:var(--bg);border-radius:7px;font-size:12px;color:var(--text2);cursor:pointer;white-space:nowrap;transition:.15s}
+        .auto-clean-toggle:hover{border-color:var(--primary);color:var(--primary);background:var(--primary-bg)}
+        .auto-clean-toggle input{accent-color:var(--primary);cursor:pointer}
+        /* ===== Layout ===== */
+        .layout{display:flex;height:calc(100vh - 50px)}
+        /* ===== Left tree panel ===== */
+        .tree-panel{width:260px;background:var(--surface);border-right:1px solid var(--border);display:flex;flex-direction:column;flex-shrink:0;overflow:hidden}
+        /* 左侧功能模块列表 */
+        .fn-list{display:flex;flex-direction:column;gap:3px;padding:8px;border-bottom:1px solid var(--border);flex-shrink:0}
+        .fn-btn{padding:8px 10px;border:none;background:var(--bg);border-radius:6px;cursor:pointer;font-size:12.5px;color:var(--text2);text-align:left;transition:.15s}
+        .fn-btn:hover{background:var(--primary-bg);color:var(--primary)}
+        .fn-btn.active{background:var(--primary);color:#fff}
+        .tree-head{padding:10px 14px;font-weight:700;font-size:13px;border-bottom:1px solid var(--border);display:flex;align-items:center;gap:8px}
+        .tree-head .badge{font-size:10px;background:var(--primary-bg);color:var(--primary);padding:1px 7px;border-radius:10px;font-weight:600}
+        .tree-box{flex:1;overflow-y:auto;padding:6px}
+        .tree-box::-webkit-scrollbar{width:5px}
+        .tree-box::-webkit-scrollbar-thumb{background:#ccd2dc;border-radius:3px}
+        .tree-item{display:flex;align-items:center;gap:8px;padding:6px 8px;border-radius:6px;cursor:pointer;font-size:12.8px;user-select:none}
+        .tree-item:hover{background:var(--primary-bg)}
+        .tree-item.sel{background:var(--primary-bg);box-shadow:inset 2px 0 0 var(--primary)}
+        .tree-item .sw{width:13px;height:13px;border-radius:3px;border:1px solid rgba(0,0,0,.25);flex-shrink:0}
+        .tree-item .nm{flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+        .tree-item .tri{font-size:10.5px;color:var(--text3)}
+        .tree-item .eye{cursor:pointer;font-size:13px;color:var(--text3);width:18px;text-align:center;border-radius:4px}
+        .tree-item .eye:hover{background:#fff;color:var(--text)}
+        .tree-item .lens{cursor:pointer;font-size:13px;color:var(--text3);width:18px;text-align:center;border-radius:4px}
+        .tree-item .lens:hover{background:#fff;color:var(--primary)}
+        .tree-foot{padding:8px;border-top:1px solid var(--border);display:flex;gap:6px}
+        .tf-btn{flex:1;padding:6px;font-size:11.5px;border:1px solid var(--border);background:var(--bg);border-radius:6px;cursor:pointer;color:var(--text2)}
+        .tf-btn:hover{color:var(--primary);border-color:var(--primary)}
+        /* ===== Viewer ===== */
+        .viewer-wrap{flex:1;position:relative;overflow:hidden;background:radial-gradient(ellipse at 50% 40%,#94a7bf 0%,#6b7c95 100%)}
+        #viewer{width:100%;height:100%}
+        /* top-right toolbar */
+        .vtool{position:absolute;top:10px;right:10px;display:flex;flex-direction:column;gap:3px;z-index:10}
+        .vtool button{width:44px;height:44px;border:1px solid rgba(255,255,255,.6);background:rgba(255,255,255,.82);backdrop-filter:blur(8px);border-radius:7px;cursor:pointer;font-size:17px;box-shadow:var(--shadow);transition:.15s}
+        .vtool button:hover{background:#fff;transform:translateY(-1px)}
+        .vtool button.active{background:var(--primary);color:#fff;border-color:var(--primary)}
+        .vtool .sep{height:1px;background:var(--border);margin:2px 8px}
+        /* bottom toolbar */
+        .btool{position:absolute;bottom:12px;left:50%;transform:translateX(-50%);display:flex;gap:3px;background:rgba(255,255,255,.88);backdrop-filter:blur(10px);border-radius:12px;padding:5px 8px;box-shadow:var(--shadow);z-index:10;border:1px solid rgba(255,255,255,.6)}
+        .btool button{width:42px;height:42px;border:none;background:transparent;border-radius:7px;cursor:pointer;font-size:17px;color:#5a6678;transition:.15s}
+        .btool button:hover{background:rgba(0,0,0,.06)}
+        .btool button.active{background:var(--primary);color:#fff}
+        .btool .sep{width:1px;background:var(--border);margin:0 3px}
+        /* view cube */
+        .viewcube{position:absolute;bottom:70px;right:12px;width:74px;height:74px;z-index:10;background:rgba(255,255,255,.8);backdrop-filter:blur(8px);border-radius:7px;display:flex;flex-wrap:wrap;overflow:hidden;box-shadow:var(--shadow);border:1px solid rgba(255,255,255,.6)}
+        .viewcube div{width:33.33%;height:33.33%;display:flex;align-items:center;justify-content:center;font-size:9px;font-weight:700;color:#5a6678;cursor:pointer;border:1px solid rgba(0,0,0,.03);transition:.12s}
+        .viewcube div:hover{background:var(--primary-bg);color:var(--primary)}
+        .viewcube div.home{background:var(--primary);color:#fff}
+        /* status bar */
+        .status{position:absolute;bottom:0;left:0;right:0;height:22px;background:rgba(20,28,40,.18);backdrop-filter:blur(3px);font-size:11px;color:#eef2f8;display:flex;align-items:center;gap:14px;padding:0 12px;z-index:10;pointer-events:none}
+        .status .sp{color:rgba(255,255,255,.35)}
+        .status .tri{margin-left:auto}
+        /* property panel */
+        .prop-panel{position:absolute;top:10px;left:10px;width:250px;background:rgba(255,255,255,.92);backdrop-filter:blur(12px);border-radius:10px;box-shadow:var(--shadow);padding:12px 14px;z-index:20;display:none;font-size:12.3px;border:1px solid rgba(255,255,255,.7)}
+        .prop-panel h4{font-size:12.8px;margin-bottom:8px;display:flex;align-items:center;gap:6px}
+        .prop-panel .row{display:flex;justify-content:space-between;padding:3px 0;border-bottom:1px dashed var(--border)}
+        .prop-panel .row .k{color:var(--text2)}
+        .prop-panel .row .v{font-weight:600}
+        .prop-close{background:none;border:none;cursor:pointer;font-size:13px;color:var(--text3);margin-left:auto}
+        .prop-close:hover{color:var(--text)}
+        /* loading */
+        .loading{position:absolute;inset:0;background:rgba(30,40,55,.35);backdrop-filter:blur(3px);display:none;align-items:center;justify-content:center;z-index:100}
+        .loading.show{display:flex}
+        .spin{width:38px;height:38px;border:3px solid rgba(255,255,255,.5);border-top-color:#fff;border-radius:50%;animation:sp 0.8s linear infinite}
+        @keyframes sp{to{transform:rotate(360deg)}}
+        /* side panels (工程功能) */
+        .panel-backdrop{position:absolute;inset:0;z-index:29;background:rgba(0,0,0,.12);display:none}
+        .panel-backdrop.show{display:block}
+        .panels{position:absolute;left:0;top:0;bottom:0;width:280px;background:var(--surface);border-right:1px solid var(--border);z-index:30;display:none;flex-direction:column;box-shadow:3px 0 18px rgba(0,0,0,.08)}
+        .panels.show{display:flex}
+        .panels .ph{padding:12px 14px;border-bottom:1px solid var(--border);font-weight:700;font-size:13.5px;display:flex;align-items:center;gap:8px}
+        .panels .ph button{margin-left:auto;background:none;border:none;cursor:pointer;font-size:15px;color:var(--text3)}
+        .panels .pb{flex:1;overflow-y:auto;padding:14px}
+        /* 多面板：右侧容器内可纵向堆叠多个同时打开的面板卡片 */
+        .panels .panel-stack{flex:1;overflow-y:auto;padding:8px;display:flex;flex-direction:column;gap:8px;min-height:0}
+        .panels .panel-card{background:var(--surface);border:1px solid var(--border);border-radius:8px;box-shadow:var(--shadow);display:none;flex-direction:column;flex-shrink:0;min-height:0}
+        .panels .panel-card.show{display:flex}
+        .panels .panel-card .ph{padding:10px 12px;border-bottom:1px solid var(--border);font-weight:700;font-size:13px;display:flex;align-items:center;gap:8px;flex-shrink:0}
+        .panels .panel-card .ph button{margin-left:auto;background:none;border:none;cursor:pointer;font-size:15px;color:var(--text3)}
+        .panels .panel-card .pb{flex:0 0 auto;overflow-y:auto;padding:12px}
+        /* 装配·拼合 面板 */
+        .asm-part{border:1px solid var(--border);border-radius:8px;padding:10px;margin:10px 0}
+        .asm-part label.f{margin-top:8px}
+        .asm-part .asm-row{display:flex;align-items:center;gap:6px;font-size:12.5px;margin-top:8px;color:var(--text2)}
+        .asm-part .asm-offv{font-weight:700;color:var(--primary-dark)}
+        .asm-part input[type=range]{margin-top:2px}
+        .panels label.f{display:block;font-size:12px;font-weight:600;margin:10px 0 4px}
+        .panels input[type=number],.panels input[type=text],.panels select{width:100%;padding:8px 10px;border:1.4px solid var(--border);border-radius:6px;font-size:13px;font-family:inherit;outline:none}
+        .panels input:focus{border-color:var(--primary)}
+        .btn{display:block;width:100%;padding:9px;border:none;border-radius:7px;background:linear-gradient(135deg,#4f8cf7,#6c5ce7);color:#fff;font-size:13px;font-weight:600;cursor:pointer;margin-top:12px;transition:.2s}
+        .btn:hover{transform:translateY(-1px);box-shadow:0 4px 12px rgba(79,140,247,.35)}
+        .btn.small{padding:7px;font-size:12px}
+        .panels .hint{font-size:11.5px;color:var(--text3);margin-top:5px;line-height:1.5}
+        .status-msg{border-radius:7px;padding:8px 10px;font-size:12px;margin-top:10px;display:none;line-height:1.5}
+        .status-msg.show{display:block}
+        .status-msg.ok{background:#e9f9ef;color:#0a6e35;border:1px solid #b7ecd0}
+        .status-msg.err{background:#fdecec;color:#a11;border:1px solid #f6c6c6}
+        .status-msg.info{background:var(--primary-bg);color:var(--primary-dark);border:1px solid #c9ddfd}
+        .panel-body label.f:first-child{margin-top:0}
+    </style>
+</head>
+<body>
+    <div class="header">
+        <div class="logo">3D</div>
+        <div class="logo-txt">三维模型查看系统</div>
+        <span class="logo-sub">OpenCASCADE</span>
+        <div class="spacer"></div>
+        <div class="header-actions">
+            <button class="ha-btn" data-panel="upload">📂 上传模型</button>
+            <button class="ha-btn" data-panel="measure">📏 测量</button>
+            <button class="ha-btn" data-panel="cutplane">✂️ 剖切</button>
+            <button class="ha-btn" data-panel="mold">🔨 模具</button>
+            <button class="ha-btn" data-panel="mirror">🪞 镜像与旋转</button>
+            <button class="ha-btn" data-panel="corner">🔧 角落闭合</button>
+            <button class="ha-btn" data-panel="refix">🛠 模具再修理</button>
+            <button class="ha-btn" data-panel="assembly">🧩 装配</button>
+            <button class="ha-btn" data-panel="contact">📐 形变配合面</button>
+            <button class="ha-btn" data-panel="m2">🏭 模具自动生成</button>
+            <button class="ha-btn" data-panel="holefill">🕳 孔洞补齐</button>
+            <label class="auto-clean-toggle" title="开启后：每次生成结束保留最终 .stp，自动清除几何缓存 JSON 与再修理中间件"><input type="checkbox" id="autoCleanChk"> 🧹 自动清理中间产物</label>
+        </div>
+    </div>
+    <div class="layout">
+        <!-- 左侧：功能模块 + 模型树 -->
+        <div class="tree-panel">
+            <div class="fn-list" id="fnList">
+                <button class="fn-btn" data-panel="upload">📂 上传模型</button>
+                <button class="fn-btn" data-panel="measure">📏 测量</button>
+                <button class="fn-btn" data-panel="cutplane">✂️ 剖切</button>
+                <button class="fn-btn" data-panel="mold">🔨 模具</button>
+                <button class="fn-btn" data-panel="mirror">🪞 镜像与旋转</button>
+                <button class="fn-btn" data-panel="corner">🔧 角落闭合</button>
+                <button class="fn-btn" data-panel="refix">🛠 模具再修理</button>
+                <button class="fn-btn" data-panel="assembly">🧩 装配</button>
+                <button class="fn-btn" data-panel="contact">📐 形变配合面</button>
+                <button class="fn-btn" data-panel="m2">🏭 模具自动生成</button>
+                <button class="fn-btn" data-panel="holefill">🕳 孔洞补齐</button>
+            </div>
+            <div class="tree-head">🎄 模型树 <span class="badge" id="treeCount">0 实体</span></div>
+            <div class="tree-box" id="treeBox"><div style="color:var(--text3);font-size:12px;padding:10px">尚未加载模型 — 点击上方「上传模型」</div></div>
+            <div class="tree-foot">
+                <button class="tf-btn" id="showAllBtn">👁 全部显示</button>
+                <button class="tf-btn" id="hideAllBtn">🚫 全部隐藏</button>
+            </div>
+        </div>
+        <!-- 3D 视图 -->
+        <div class="viewer-wrap">
+            <div id="viewer"></div>
+            <div class="loading" id="loading"><div class="spin"></div></div>
+            <!-- 右侧工具 -->
+            <div class="vtool">
+                <button id="fitBtn" title="适配模型">⊞</button>
+                <button id="axisBtn" title="坐标轴">⊕</button>
+                <div class="sep"></div>
+                <button id="isoBtn" title="等轴测">◈</button>
+                <button id="frontBtn" title="前视图">▣</button>
+                <button id="topBtn" title="俯视图">▤</button>
+                <button id="leftBtn" title="左视图">▥</button>
+            </div>
+            <!-- 底部工具 -->
+            <div class="btool">
+                <button id="rotateBtn" title="自动旋转" class="active">⟳</button>
+                <button id="gridBtn" title="网格" class="active">⊞</button>
+                <button id="wireBtn" title="线框 (W)">◇</button>
+                <button id="edgeBtn" title="边线 (E)" class="active">‖</button>
+                <div class="sep"></div>
+                <button id="panBtn" title="平移模式：点击后用左键拖动平移 (P)">✥</button>
+                <button id="liveBtn" title="实时位置：鼠标悬停显示所在封闭面 (L)">◎</button>
+                <button id="markBtn" title="表面标注：上红/下蓝/侧橙 (S)">🎨</button>
+                <div class="sep"></div>
+                <button id="semiBtn" title="半透明">◐</button>
+                <button id="matBtn" title="材质">🧪</button>
+            </div>
+            <!-- 视图立方体 -->
+            <div class="viewcube" id="viewcube">
+                <div data-v="front">前</div><div data-v="top">上</div><div data-v="right">右</div>
+                <div data-v="bottom">下</div><div class="home" data-v="home">3D</div><div data-v="left">左</div>
+                <div data-v="back">后</div><div data-v="iso">轴</div><div data-v="reset">复</div>
+            </div>
+            <!-- 属性面板 -->
+            <div class="prop-panel" id="propPanel">
+                <h4>🔍 选中对象 <button class="prop-close" onclick="closeProp()">✕</button></h4>
+                <div id="propBody"></div>
+            </div>
+            <!-- 状态栏 -->
+            <div class="status">
+                <span id="stMode">就绪</span><span class="sp">|</span><span id="stInfo">无模型</span><span class="sp">|</span>
+                <span>拖拽旋转 · 滚轮缩放 · 右键平移</span><span class="tri" id="stTri"></span>
+            </div>
+            <!-- 面板遮罩层（点击关闭全部面板） -->
+            <div class="panel-backdrop" id="panelBackdrop" onclick="closeAllPanels()"></div>
+            <!-- 工程功能面板（可多个同时打开，纵向堆叠） -->
+            <div class="panels" id="panels">
+                <div class="panel-stack" id="panelStack"></div>
+            </div>
+        </div>
+    </div>
+
+    <script type="module">
+        import * as THREE from 'three';
+        import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+        import { Line2 } from 'three/addons/lines/Line2.js';
+        import { LineMaterial } from 'three/addons/lines/LineMaterial.js';
+        import { LineGeometry } from 'three/addons/lines/LineGeometry.js';
+        import { LineSegments2 } from 'three/addons/lines/LineSegments2.js';
+        import { LineSegmentsGeometry } from 'three/addons/lines/LineSegmentsGeometry.js';
+        import { EffectComposer } from 'three/addons/postprocessing/EffectComposer.js';
+        import { RenderPass } from 'three/addons/postprocessing/RenderPass.js';
+        import { ShaderPass } from 'three/addons/postprocessing/ShaderPass.js';
+        import { FXAAShader } from 'three/addons/shaders/FXAAShader.js';
+        import { RoomEnvironment } from 'three/addons/environments/RoomEnvironment.js';
+
+        /* ================= 场景 ================= */
+        const container = document.getElementById('viewer');
+        const scene = new THREE.Scene();
+        // 竖向渐变背景（顶部冷灰蓝、底部亮白），比纯色更有层次，衬托实体轮廓
+        (function(){
+            const c=document.createElement('canvas'); c.width=2; c.height=512;
+            const g=c.getContext('2d'); const grd=g.createLinearGradient(0,0,0,512);
+            grd.addColorStop(0,'#e9ebee'); grd.addColorStop(0.5,'#f1f2f4'); grd.addColorStop(1,'#fafbfc');
+            g.fillStyle=grd; g.fillRect(0,0,2,512);
+            const tx=new THREE.CanvasTexture(c); tx.colorSpace=THREE.SRGBColorSpace;
+            scene.background=tx;
+        })();
+        const camera = new THREE.PerspectiveCamera(40, container.clientWidth/container.clientHeight, 0.1, 1e6);
+        camera.position.set(180,140,240);
+        const renderer = new THREE.WebGLRenderer({antialias:true, powerPreference:'high-performance'});
+        renderer.setSize(container.clientWidth, container.clientHeight);
+        // 像素比上限 2.0：4K 屏也不至于让 GPU 填充压力过大导致卡顿
+        renderer.setPixelRatio(Math.min(devicePixelRatio, 2.0));
+        renderer.toneMapping = THREE.NoToneMapping;   // CAD 工程图风格：平直明亮，避免 ACES 压暗/高对比
+        renderer.toneMappingExposure = 1.0;
+        renderer.outputColorSpace = THREE.SRGBColorSpace;
+        renderer.samples = 4;
+        container.appendChild(renderer.domElement);
+
+        // 实体感关键：HDR 环境反射贴图。
+        // 让材质反射环境光形成连续流动的高光，曲面不再灰平发虚，而是像真实实体一样有立体光泽
+        {
+            const pmrem = new THREE.PMREMGenerator(renderer);
+            const envScene = new RoomEnvironment();
+            scene.environment = pmrem.fromScene(envScene, 0.04).texture;
+            pmrem.dispose();
+        }
+
+        // CAD 工程图风格布光：柔和、低对比，避免强高光/硬阴影
+        scene.add(new THREE.AmbientLight(0xffffff, 0.75));
+        scene.add(new THREE.HemisphereLight(0xffffff, 0xdfe3e8, 0.55));
+        const key = new THREE.DirectionalLight(0xffffff, 0.75); key.position.set(180,300,240); scene.add(key);
+        const fill = new THREE.DirectionalLight(0xffffff, 0.35); fill.position.set(-220,120,-160); scene.add(fill);
+        const rim = new THREE.DirectionalLight(0xffffff, 0.4); rim.position.set(-60,180,-260); scene.add(rim);
+        const bot = new THREE.DirectionalLight(0xdde3ea, 0.2); bot.position.set(0,-240,0); scene.add(bot);
+        const grid = new THREE.GridHelper(200,20,0xc9d2da,0xe2e7ec); scene.add(grid);
+        // 地面软阴影：径向渐变圆盘置于模型正下方，提供“落地”与景深（无需真实阴影映射，零性能损耗）
+        const groundShadow = (function(){
+            const c=document.createElement('canvas'); c.width=c.height=256;
+            const g=c.getContext('2d'); const grd=g.createRadialGradient(128,128,10,128,128,128);
+            grd.addColorStop(0,'rgba(40,52,72,0.45)'); grd.addColorStop(0.55,'rgba(40,52,72,0.2)'); grd.addColorStop(1,'rgba(40,52,72,0)');
+            g.fillStyle=grd; g.fillRect(0,0,256,256);
+            const tx=new THREE.CanvasTexture(c);
+            const m=new THREE.Mesh(new THREE.PlaneGeometry(1,1),new THREE.MeshBasicMaterial({map:tx,transparent:true,depthWrite:false,opacity:0.9}));
+            m.rotation.x=-Math.PI/2; m.renderOrder=1; m.visible=false;
+            scene.add(m);
+            return m;
+        })();
+        const controls = new OrbitControls(camera, renderer.domElement);
+        controls.enableDamping=true; controls.dampingFactor=.1; controls.autoRotate=true; controls.autoRotateSpeed=1.8; controls.target.set(0,0,0);
+
+        const composer = new EffectComposer(renderer);
+        composer.addPass(new RenderPass(scene,camera));
+        const fxaaPass = new ShaderPass(FXAAShader);
+        const _px = renderer.getPixelRatio();
+        fxaaPass.uniforms['resolution'].value.set(1/(container.clientWidth*_px),1/(container.clientHeight*_px));
+        composer.addPass(fxaaPass);
+
+        /* ================= 状态 ================= */
+        const modelGroup = new THREE.Group(), surfaceGroup = new THREE.Group(), bodyColGroup = new THREE.Group(), edgeGroup = new THREE.Group(), wireGroup = new THREE.Group();
+        scene.add(modelGroup); scene.add(surfaceGroup); scene.add(bodyColGroup); scene.add(edgeGroup); scene.add(wireGroup);
+        let bodyEntries = [], clickableMeshes = [], curModelPath=null, curInfo=null, showMark=false;
+        let modelColor = [0.95,0.95,0.96];
+        const BODY_COLORS = [0xff2d2d,0x2d6bff,0xff9100,0x2db14e,0x9b59b6,0x00bcd4,0xe74c3c,0xf39c12,0x8e44ad,0x16a085,0xc0392b,0x7f8c8d];
+
+        /* ================= 坐标轴 ================= */
+        let axisG = new THREE.Group(); scene.add(axisG); axisG.visible=false;
+        (function(){
+            const dirs=[[1,0,0],[0,1,0],[0,0,1]], cols=[0xff5555,0x55cc55,0x55aaff], names=['X','Y','Z'];
+            dirs.forEach((d,i)=>{
+                const m=new THREE.MeshBasicMaterial({color:cols[i]});
+                const shaft=new THREE.Mesh(new THREE.CylinderGeometry(.7,.7,48,8),m);
+                shaft.position.set(d[0]*24,d[1]*24,d[2]*24);
+                if(d[0])shaft.rotation.z=-Math.PI/2; else if(d[2])shaft.rotation.x=Math.PI/2;
+                axisG.add(shaft);
+                const cone=new THREE.Mesh(new THREE.ConeGeometry(1.6,6,8),m);
+                cone.position.set(d[0]*51,d[1]*51,d[2]*51);
+                if(d[0])cone.rotation.z=-Math.PI/2; else if(d[2])cone.rotation.x=Math.PI/2;
+                axisG.add(cone);
+                const cv=document.createElement('canvas');cv.width=128;cv.height=64;
+                const cx=cv.getContext('2d');cx.font='Bold 44px Arial';cx.textAlign='center';cx.textBaseline='middle';
+                cx.fillStyle='#'+cols[i].toString(16).padStart(6,'0');cx.fillText(names[i],64,36);
+                const tx=new THREE.CanvasTexture(cv), sp=new THREE.Sprite(new THREE.SpriteMaterial({map:tx,depthTest:false,transparent:true}));
+                sp.position.set(d[0]*60,d[1]*60,d[2]*60); sp.scale.set(11,5.5,1); axisG.add(sp);
+            });
+        })();
+
+        /* ================= 工具函数 ================= */
+        const matCache={};
+        // CAD 工程图风格材质：哑光（高粗糙度、零金属/清漆），浅灰表面柔和受光，贴近参考图效果
+        // CAD 工程图风格材质：哑光（高粗糙度、零金属/清漆），浅灰表面柔和受光，贴近参考图效果
+        // polygonOffset：把表面在深度上轻微推后，避免与贴合在表面上的特征线共面，导致侧面视角发生
+        // Z-fighting 而闪光/发糊（线总是稳定地盖在表面之上）。
+        function getMat(color){ const k=color.join(','); if(!matCache[k])matCache[k]=new THREE.MeshStandardMaterial({color:new THREE.Color(...color),metalness:0.0,roughness:0.96,flatShading:false,side:THREE.DoubleSide,envMapIntensity:0.15,polygonOffset:true,polygonOffsetFactor:1,polygonOffsetUnits:1}); return matCache[k]; }
+        function fit(sz){const d=Math.max(sz,1)*2.4;controls.target.set(0,0,0);camera.position.set(d*.62,d*.45,d);controls.update();}
+        function setView(dx,dy,dz){const base=curInfo?Math.max(...curInfo.size)*2.4:200;const s=camera.position.clone(),e=new THREE.Vector3(dx*base,dy*base,dz*base);const t0=Date.now();
+            (function an(){const t=Math.min((Date.now()-t0)/300,1),ease=t*(2-t);camera.position.lerpVectors(s,e,ease);controls.target.set(0,0,0);controls.update();if(t<1)requestAnimationFrame(an);})();}
+        function showStatus(msg,type,el){if(typeof el==='string')el=document.getElementById(el);if(!el)el=document.getElementById('panelStatus');if(!el)return;el.className='status-msg show '+(type||'info');el.textContent=msg;}
+        function setStInfo(txt){document.getElementById('stInfo').textContent=txt;}
+        function loadSpin(on){document.getElementById('loading').classList.toggle('show',on);}
+
+        /* ================= 法线分裂：硬边锐利 + 曲面平滑 ================= */
+        // 直接 computeVertexNormals 会把共享顶点的相邻面法线平均，导致 90° 折弯等硬边被
+        // “抹圆”、边缘发糊。此函数按两面夹角阈值分裂共享顶点：夹角 < 阈值(平滑区，如圆角)
+        // 继续平滑；夹角 ≥ 阈值(硬边)各自独立法线，从而同时得到锐利棱边 + 圆角连续曲面。
+        function computeSplitNormals(geo, thresholdDeg){
+            thresholdDeg = thresholdDeg || 40;
+            const pos = geo.getAttribute('position');
+            const index = geo.getIndex();
+            if(!index){ geo.computeVertexNormals(); return geo; }
+            const triCount = index.count/3;
+            const fn = new Float32Array(triCount*3);
+            const A=new THREE.Vector3(),B=new THREE.Vector3(),C=new THREE.Vector3(),e1=new THREE.Vector3(),e2=new THREE.Vector3(),n=new THREE.Vector3();
+            for(let t=0;t<triCount;t++){
+                A.fromBufferAttribute(pos,index.getX(t*3));
+                B.fromBufferAttribute(pos,index.getX(t*3+1));
+                C.fromBufferAttribute(pos,index.getX(t*3+2));
+                e1.subVectors(B,A); e2.subVectors(C,A); n.crossVectors(e1,e2).normalize();
+                fn[t*3]=n.x; fn[t*3+1]=n.y; fn[t*3+2]=n.z;
+            }
+            const vertTris=new Map();
+            for(let t=0;t<triCount;t++)for(let k=0;k<3;k++){
+                const v=index.getX(t*3+k); let a=vertTris.get(v); if(!a){a=[];vertTris.set(v,a);} a.push(t);
+            }
+            const cosT=Math.cos(thresholdDeg*Math.PI/180);
+            const outPos=[],outNrm=[],outIdx=[];
+            const keyMap=new Map();
+            vertTris.forEach((tris,v)=>{
+                const cnt=tris.length;
+                const parent=new Int32Array(cnt); for(let i=0;i<cnt;i++)parent[i]=i;
+                const find=x=>{let r=x;while(parent[r]!==r)r=parent[r];while(parent[x]!==r){const p=parent[x];parent[x]=r;x=p;}return r;};
+                for(let i=0;i<cnt;i++)for(let j=i+1;j<cnt;j++){
+                    const t1=tris[i],t2=tris[j];
+                    const d=fn[t1*3]*fn[t2*3]+fn[t1*3+1]*fn[t2*3+1]+fn[t1*3+2]*fn[t2*3+2];
+                    if(d>cosT){const ri=find(i),rj=find(j);if(ri!==rj)parent[ri]=rj;}
+                }
+                const rep=new Map();
+                for(let i=0;i<cnt;i++){
+                    const r=find(i);
+                    let gv=rep.get(r);
+                    if(gv===undefined){
+                        let sx=0,sy=0,sz=0;
+                        for(let j=0;j<cnt;j++)if(find(j)===r){const t=tris[j];sx+=fn[t*3];sy+=fn[t*3+1];sz+=fn[t*3+2];}
+                        const l=Math.hypot(sx,sy,sz)||1;
+                        outPos.push(pos.getX(v),pos.getY(v),pos.getZ(v));
+                        outNrm.push(sx/l,sy/l,sz/l);
+                        gv=outPos.length/3-1;
+                        rep.set(r,gv);
+                    }
+                    keyMap.set(v+':'+tris[i], gv);
+                }
+            });
+            for(let t=0;t<triCount;t++)for(let k=0;k<3;k++){
+                outIdx.push(keyMap.get(index.getX(t*3+k)+':'+t));
+            }
+            geo.setAttribute('position',new THREE.BufferAttribute(new Float32Array(outPos),3));
+            geo.setAttribute('normal',new THREE.BufferAttribute(new Float32Array(outNrm),3));
+            geo.setIndex(outIdx);
+            return geo;
+        }
+
+        /* ================= 顶点焊接：缝合相邻面缝隙（修复「线条断裂/面发噪」） ================= */
+        // OCCT 对每个面单独网格化，相邻面共享边上的顶点坐标并不完全一致（差 1e-4~1e-2mm），
+        // 这些“裂缝”会让 EdgesGeometry 把缝当成边界画出一圈圈碎线，同时光照在缝处断裂产生噪点。
+        // 此函数把容差内的近重合顶点合并为一个，彻底闭合裂缝 → 边线干净、曲面平滑。
+        function weldBufferGeometry(geo, relTol){
+            const pos=geo.getAttribute('position');
+            const index=geo.getIndex();
+            if(!index) return geo;
+            pos.computeBoundingBox();
+            const bb=pos.boundingBox;
+            const size=Math.max(bb.max.x-bb.min.x, bb.max.y-bb.min.y, bb.max.z-bb.min.z)||1;
+            const tol=Math.max(1e-3, Math.min((relTol||1e-4)*size, 0.05));   // 容差随模型尺度缩放并封顶
+            const inv=1/tol;
+            const map=new Map(), oldToNew=new Int32Array(pos.count), outPos=[];
+            for(let i=0;i<pos.count;i++){
+                const key=Math.round(pos.getX(i)*inv)+'_'+Math.round(pos.getY(i)*inv)+'_'+Math.round(pos.getZ(i)*inv);
+                let gi=map.get(key);
+                if(gi===undefined){ gi=outPos.length/3; map.set(key,gi); outPos.push(pos.getX(i),pos.getY(i),pos.getZ(i)); }
+                oldToNew[i]=gi;
+            }
+            const idx=index.array, out=[]; let merged=0;
+            for(let i=0;i<idx.length;i+=3){
+                const a=oldToNew[idx[i]], b=oldToNew[idx[i+1]], c=oldToNew[idx[i+2]];
+                if(a===b||b===c||a===c){ merged++; continue; }   // 去除退化三角形
+                out.push(a,b,c);
+            }
+            if(!out.length || out.length===idx.length && pos.count===outPos.length/3) return geo;
+            geo.setAttribute('position',new THREE.BufferAttribute(new Float32Array(outPos),3));
+            geo.setIndex(new THREE.BufferAttribute(new Uint32Array(out),1));
+            return geo;
+        }
+
+        /* ================= 落地：网格与地面软阴影贴合模型底部 ================= */
+        function updateGround(){
+            if(!curInfo){ groundShadow.visible=false; return; }
+            const bb=new THREE.Box3().setFromObject(modelGroup);
+            if(bb.isEmpty()){ groundShadow.visible=false; return; }
+            const mn=bb.min, mx=bb.max;
+            grid.position.y = mn.y;
+            const cx=(mn.x+mx.x)/2, cz=(mn.z+mx.z)/2;
+            const r=Math.max((mx.x-mn.x)/2,(mx.z-mn.z)/2,1);
+            grid.scale.setScalar(Math.max(r*2.4/200, 1));
+            groundShadow.position.set(cx, mn.y+0.6, cz);
+            groundShadow.scale.set(r*3.0, r*3.0, 1);
+            groundShadow.visible=true;
+        }
+
+        /* ================= 自适应渲染质量 ================= */
+        // 大型模型(数十万~上百万三角面)+高像素比+MSAA 会拖垮 GPU 填充率导致"卡死"。
+        // 根据面数动态降低像素比/关闭 MSAA，保证加载后交互仍然流畅。
+        function adaptQuality(totalT){
+            let px = Math.min(devicePixelRatio, 2.0);
+            let samples = 4;
+            if(totalT > 400000){ px = Math.min(px, 1.5); samples = 2; }
+            if(totalT > 1000000){ px = Math.min(px, 1.25); samples = 0; }
+            if(totalT > 3000000){ px = 1; samples = 0; }
+            if(renderer.getPixelRatio() !== px || renderer.samples !== samples){
+                renderer.setPixelRatio(px);
+                renderer.samples = samples;
+                renderer.setSize(container.clientWidth, container.clientHeight);
+                composer.setSize(container.clientWidth, container.clientHeight);
+                const w=container.clientWidth,h=container.clientHeight,p2=renderer.getPixelRatio();
+                fxaaPass.uniforms['resolution'].value.set(1/(w*p2),1/(h*p2));
+                updateEdgeLineResolution();
+            }
+        }
+
+        /* ================= 模型加载 ================= */
+        function clearAll(){
+            [modelGroup,surfaceGroup,bodyColGroup,edgeGroup,wireGroup].forEach(g=>{while(g.children.length){const c=g.children[0];if(c.geometry)c.geometry.dispose();if(c.material){if(Array.isArray(c.material))c.material.forEach(m=>m.dispose());else c.material.dispose();}g.remove(c);}});
+            bodyEntries=[];clickableMeshes=[];showMark=false;document.getElementById('markBtn').classList.remove('active');
+            document.getElementById('treeBox').innerHTML='<div style="color:var(--text3);font-size:12px;padding:10px">尚未加载模型</div>';
+            document.getElementById('treeCount').textContent='0 实体';
+        }
+        const BIG_MODEL_TRIS = 300000;  // 超过此面数进入"大模型快速模式"：跳过重建/标注/逐边线
+        // 用后端返回的真实 BREP 拓扑边绘制 CAD 特征线（圆盘/圆槽/孔的完整轮廓与切边）。
+        // 每条边是采样的折线顶点 [x,y,z,...]，连成线段对后用 LineSegments2 渲染。
+        // 这是 CAD 视图的关键：EdgesGeometry 只能按三角网格二面角推断，会丢失切边(tangent edge)
+        // 与轮廓边(silhouette)，导致圆盘/圆槽边框缺失；拓扑边则完整、准确且与视角无关。
+        // 用 LineSegments2（fat line）替代 LineBasicMaterial：浏览器普遍把后者线宽钳制为 1px，
+        // 细线在 FXAA 下发虚、模糊；fat line 支持真实像素线宽 + 平滑抗锯齿，线条锐利清晰。
+        const edgeLineMats=[];   // 收集所有特征线材质，渲染尺寸/像素比变化时同步更新 resolution
+        function makeEdgeLine2(posArray, color, opts){
+            opts=opts||{};
+            const lg=new LineSegmentsGeometry();
+            lg.setPositions(posArray);          // posArray 为成对顶点 [x,y,z,...]，与 LineSegments 一致
+            const lm=new LineMaterial({color:color, linewidth:(opts.linewidth||1.5),
+                transparent:!!opts.transparent, opacity:(opts.opacity!=null?opts.opacity:1)});
+            const sz=renderer.getDrawingBufferSize(new THREE.Vector2());
+            lm.resolution.set(sz.x, sz.y);      // 线宽以"像素"为单位，分辨率必须与实际绘制缓冲一致
+            edgeLineMats.push(lm);
+            const l2=new LineSegments2(lg, lm);
+            if(opts.renderOrder!=null) l2.renderOrder=opts.renderOrder;
+            return l2;
+        }
+        function updateEdgeLineResolution(){
+            const sz=renderer.getDrawingBufferSize(new THREE.Vector2());
+            edgeLineMats.forEach(m=>m.resolution.set(sz.x,sz.y));
+        }
+        function addFeatureEdges(edges){
+            const pts=[];
+            const MAX_PTS=200000; // 防超大模型 JSON 爆炸，硬性封顶
+            let cnt=0;
+            for(const e of (edges||[])){
+                const v=e&&e.vertices; if(!v||v.length<6) continue;
+                const seg=Math.floor((v.length-3)/3);
+                for(let k=0;k+5<v.length && cnt<MAX_PTS;k+=3,cnt++){
+                    pts.push(v[k],v[k+1],v[k+2],v[k+3],v[k+4],v[k+5]);
+                }
+            }
+            if(!pts.length) return;
+            edgeGroup.add(makeEdgeLine2(new Float32Array(pts), 0x2a2e35));
+        }
+        function addToScene(solid, idx, bigMode){
+            const verts=solid.vertices, tris=solid.triangles;
+            // 当前结构体是否携带真实 BREP 拓扑边（后端 step_reader 采样，含全部孔/槽/圆盘轮廓）
+            const hasBrep = !!(solid.edges && solid.edges.length);
+            if(!verts||verts.length<3||!tris||tris.length<3)return null;
+            const geo=new THREE.BufferGeometry();
+            geo.setAttribute('position',new THREE.BufferAttribute(new Float32Array(verts),3));
+            geo.setIndex(new THREE.BufferAttribute(new Uint32Array(tris),1));
+            // 顶点焊接：缝合相邻面裂缝，避免边线把缝当边界画碎线、光照在缝处断裂发噪
+            // 法线分裂：硬边(折弯/棱)保持锐利、圆角等曲面保持平滑连续，
+            // 避免直接 computeVertexNormals 把硬边“抹圆”导致边缘发糊。
+            // 二者均做保护：任一步异常都回退到平整法线，保证模型始终可见（绝不会空白）。
+            try{
+                weldBufferGeometry(geo, 1e-4);
+                computeSplitNormals(geo, 45);
+            }catch(e){
+                console.warn('[render] 焊接/法线分裂失败，回退 computeVertexNormals：', e);
+                try{ geo.computeVertexNormals(); }catch(_){}
+            }
+
+            const mesh=new THREE.Mesh(geo,getMat(modelColor));
+            mesh.userData.isModel=true; mesh.userData.bodyIndex=idx;
+            modelGroup.add(mesh); clickableMeshes.push(mesh);
+
+            // 结构体着色：几何克隆一次即可（不重建数据）
+            const bm=new THREE.Mesh(geo.clone(),new THREE.MeshBasicMaterial({color:BODY_COLORS[idx%BODY_COLORS.length],side:THREE.DoubleSide}));
+            bm.visible=false; bodyColGroup.add(bm);
+
+            // 大模型：跳过标注分组(每面法向计算+三份顶点拷贝)和逐边线(数千 Line 对象)
+            // 只保留主渲染，保证加载即时完成不卡死；小模型保留全部展示功能
+            const sgrp=new THREE.Group(); sgrp.visible=false;
+            const wm=new THREE.Mesh(geo.clone(),new THREE.MeshBasicMaterial({color:0,wireframe:true,transparent:true,opacity:.08}));wm.visible=false;wireGroup.add(wm);
+            if(!bigMode){
+                // 表面标注分组（按法向分上/下/侧）——改用分裂后的索引，保证与法线一致
+                const pos0=geo.getAttribute('position'), idx=geo.getIndex(), kv={up:[],down:[],side:[]};
+                for(let t=0;t<idx.count;t+=3){
+                    const i0=idx.getX(t),i1=idx.getX(t+1),i2=idx.getX(t+2);
+                    const ax=pos0.getX(i1)-pos0.getX(i0),ay=pos0.getY(i1)-pos0.getY(i0),az=pos0.getZ(i1)-pos0.getZ(i0);
+                    const bx=pos0.getX(i2)-pos0.getX(i0),by=pos0.getY(i2)-pos0.getY(i0),bz=pos0.getZ(i2)-pos0.getZ(i0);
+                    const nx=ay*bz-az*by,ny=az*bx-ax*bz,nz=ax*by-ay*bx,len=Math.sqrt(nx*nx+ny*ny+nz*nz)||1,unz=nz/len;
+                    const kind=unz>0.3?'up':(unz<-0.3?'down':'side');
+                    kv[kind].push(pos0.getX(i0),pos0.getY(i0),pos0.getZ(i0),pos0.getX(i1),pos0.getY(i1),pos0.getZ(i1),pos0.getX(i2),pos0.getY(i2),pos0.getZ(i2));
+                }
+                const cols={up:0xff2d2d,down:0x2d6bff,side:0xff9100};
+                for(const k of ['up','down','side']){
+                    if(!kv[k].length)continue;
+                    const g=new THREE.BufferGeometry();g.setAttribute('position',new THREE.BufferAttribute(new Float32Array(kv[k]),3));
+                    sgrp.add(new THREE.Mesh(g,new THREE.MeshBasicMaterial({color:cols[k],side:THREE.DoubleSide})));
+                }
+                // 特征边：优先用后端返回的真实 BREP 拓扑边（含圆盘/圆槽/孔的完整轮廓与切边），
+                // 仅当无拓扑边（如 STL / 拓扑缺失）时回退到 EdgesGeometry（三角网格二面角推断，会丢切边）。
+                if(!hasBrep){
+                    try{
+                        const eg=new THREE.EdgesGeometry(geo, 40);
+                        // CAD 工程图：细黑特征边（折痕/孔/轮廓），浅灰面上清晰可见；用 fat line 保证锐利
+                        edgeGroup.add(makeEdgeLine2(eg.getAttribute('position').array, 0x2a2e35));
+                    }catch(err){/* ignore edge failure */}
+                }
+            }
+            // 真实 BREP 特征边：大模型也绘制（折线数量可控且干净），确保圆盘/圆槽轮廓完整显示
+            addFeatureEdges(solid.edges);
+            surfaceGroup.add(sgrp);
+            const name=(solid.name&&solid.name!=='Shape')?solid.name:('实体 #'+(idx+1));
+            const entry={mesh,bm,sgrp,name,visible:true,tris:tris.length/3,color:BODY_COLORS[idx%BODY_COLORS.length]};
+            bodyEntries.push(entry);
+            return entry;
+        }
+
+        /* ================= 渲染上传模型 ================= */
+        function renderModel(data){
+            loadSpin(true);
+            setTimeout(()=>{try{
+                clearAll();
+                curModelPath=data.filepath||null;
+                // 记录最近上传/查看的模型路径，供「装配·拼合」的产品结构体自动填入
+                window._productPath=curModelPath;
+                curInfo={name:data.file_name||'模型',size:data.bbox&&data.bbox.size?[data.bbox.size[0],data.bbox.size[1],data.bbox.size[2]]:[100,100,100]};
+                const solids=data.solids||[];
+                let all=[];
+                for(const s of solids){const v=s.vertices;if(!v)continue;for(let i=0;i<v.length;i+=3)all.push(v[i],v[i+1],v[i+2]);}
+                let cx=0,cy=0,cz=0;const n=all.length/3;
+                if(n){for(let i=0;i<all.length;i+=3){cx+=all[i];cy+=all[i+1];cz+=all[i+2];}cx/=n;cy/=n;cz/=n;}
+                // 先算总面数（纯读，极快），用于决定"大模型快速模式"与自适应渲染质量
+                let totalT=0, i=0;
+                for(const s of solids){ if(s.triangles) totalT += s.triangles.length/3; i++; }
+                const bigMode = totalT > BIG_MODEL_TRIS;
+                const centered=solids.map(s=>{
+                    const v=s.vertices;
+                    if(!v)return s;
+                    const cv=new Float32Array(v.length);
+                    for(let k=0;k<v.length;k+=3){cv[k]=v[k]-cx;cv[k+1]=v[k+1]-cy;cv[k+2]=v[k+2]-cz;}
+                    // 大模型自动跳过 edges 居中（前端已改用 EdgesGeometry，不再使用该数据）
+                    return {...s, vertices:Array.from(cv), edges: (s.edges||[]).map(e=>{
+                        const ev=e.vertices;if(!ev)return e;
+                        const ce=new Float32Array(ev.length);
+                        for(let k=0;k<ev.length;k+=3){ce[k]=ev[k]-cx;ce[k+1]=ev[k+1]-cy;ce[k+2]=ev[k+2]-cz;}
+                        return {...e,vertices:ce};
+                    })};
+                });
+                centered.forEach((s,j)=>{const e=addToScene(s,j,bigMode);});
+                adaptQuality(totalT);
+                updateGround();
+                const tb=document.getElementById('treeBox');tb.innerHTML='';
+                bodyEntries.forEach((e,i)=>{
+                    const row=document.createElement('div');row.className='tree-item';
+                    row.innerHTML=`<span class="sw" style="background:#${e.color.toString(16).padStart(6,'0')}"></span><span class="nm">${e.name}</span><span class="tri">${Math.round(e.tris).toLocaleString()}</span><span class="eye" data-act="eye">👁</span><span class="lens" data-act="focus">◎</span>`;
+                    row.addEventListener('click',ev=>{
+                        const act=ev.target.dataset.act;
+                        if(act==='eye'){e.visible=!e.visible;e.mesh.visible=e.visible;e.bm.visible=e.visible&&false;e.sgrp.visible=e.visible&&showMark&&false;ev.target.textContent=e.visible?'👁':'🚫';refreshMarks();return;}
+                        if(act==='focus'){
+                            bodyEntries.forEach(x=>{x.mesh.visible=(x===e);x.sgrp.visible=false;x.bm.visible=false;});
+                            if(showMark){markCurrentOnly(e,i);}
+                            tb.querySelectorAll('.tree-item').forEach(r=>r.classList.remove('sel'));
+                            row.classList.add('sel');
+                            const bb=new THREE.Box3().setFromObject(e.mesh);const c=bb.getCenter(new THREE.Vector3());
+                            const d=bb.getSize(new THREE.Vector3()).length()*2;
+                            controls.target.copy(c);camera.position.set(c.x+d*.6,c.y+d*.45,c.z+d);controls.update();
+                            setStInfo('已聚焦：'+e.name);
+                            return;
+                        }
+                        bodyEntries.forEach(x=>x.mesh.material= x===e? new THREE.MeshStandardMaterial({color:new THREE.Color(e.color),metalness:.1,roughness:.2,side:THREE.DoubleSide}):getMat(modelColor));
+                        tb.querySelectorAll('.tree-item').forEach(r=>r.classList.remove('sel'));
+                        row.classList.add('sel');
+                    });
+                    tb.appendChild(row);
+                });
+                document.getElementById('treeCount').textContent=bodyEntries.length+' 实体';
+                const sz=curInfo.size;fit(Math.max(...sz));
+                document.getElementById('stTri').textContent='三角面: '+totalT.toLocaleString();
+                setStInfo(data.file_name||'模型');
+            }catch(err){console.error(err);setStInfo('加载错误: '+err.message);}finally{loadSpin(false);}},60);
+        }
+
+        function refreshMarks(){
+            if(!showMark){bodyEntries.forEach(e=>{e.sgrp.visible=false;e.bm.visible=false;});surfaceGroup.visible=true;return;}
+            bodyEntries.forEach(e=>{e.sgrp.visible=e.mesh.visible;});
+            bodyEntries.forEach(e=>e.bm.visible=false);
+            surfaceGroup.visible=true;
+        }
+        function markCurrentOnly(e,i){
+            bodyEntries.forEach((x,xj)=>{x.sgrp.visible=(xj===i);});
+        }
+        document.getElementById('markBtn').addEventListener('click',function(){
+            showMark=!showMark;this.classList.toggle('active',showMark);
+            refreshMarks();
+            setStInfo(showMark?'表面标注：🔴上 / 🔵下 / 🟠侧':'表面标注已关闭');
+        });
+
+        /* ================= 面拾取属性 ================= */
+        function initPick(){
+            renderer.domElement.addEventListener('click',onPick);
+        }
+        function onPick(e){
+            if(e.target!==renderer.domElement)return;
+            const r=renderer.domElement.getBoundingClientRect();
+            const m=new THREE.Vector2(((e.clientX-r.left)/r.width)*2-1,-((e.clientY-r.top)/r.height)*2+1);
+            const ray=new THREE.Raycaster();ray.setFromCamera(m,camera);
+            const hits=ray.intersectObjects(clickableMeshes);
+            if(!hits.length){closeProp();return;}
+            const h=hits[0];const bi=h.object.userData.bodyIndex;
+            const entry=bodyEntries[bi];
+            if(!entry)return;
+            const fg=h.face; const p=h.point;
+            const a=h.object.geometry.getAttribute('position');
+            const ia=fg.a, ib=fg.b, ic=fg.c;
+            const pa=new THREE.Vector3(a.getX(ia),a.getY(ia),a.getZ(ia));
+            const pb=new THREE.Vector3(a.getX(ib),a.getY(ib),a.getZ(ib));
+            const pc=new THREE.Vector3(a.getX(ic),a.getY(ic),a.getZ(ic));
+            const area=pa.clone().sub(pb).cross(pa.clone().sub(pc)).length()/2;
+            const nn=pa.clone().sub(pb).cross(pa.clone().sub(pc)).normalize();
+            const kind = nn.z>0.3?'上表面(🔴)':(nn.z<-0.3?'下表面(🔵)':'侧壁(🟠)');
+            const prop=document.getElementById('propBody');
+            prop.innerHTML=
+                `<div class="row"><span class="k">所属结构体</span><span class="v" style="color:#${entry.color.toString(16).padStart(6,'0')}">${entry.name}</span></div>`+
+                `<div class="row"><span class="k">拾取点</span><span class="v">(${p.x.toFixed(1)}, ${p.y.toFixed(1)}, ${p.z.toFixed(1)})</span></div>`+
+                `<div class="row"><span class="k">面类型</span><span class="v">${kind}</span></div>`+
+                `<div class="row"><span class="k">三角面面积</span><span class="v">${area.toFixed(2)} mm²</span></div>`+
+                `<div class="row"><span class="k">面法向</span><span class="v">(${nn.x.toFixed(2)}, ${nn.y.toFixed(2)}, ${nn.z.toFixed(2)})</span></div>`+
+                `<div class="row"><span class="k">结构体三角面</span><span class="v">${Math.round(entry.tris).toLocaleString()}</span></div>`;
+            document.getElementById('propPanel').style.display='block';
+            bodyEntries.forEach(x=>x.mesh.material=getMat(modelColor));
+            entry.mesh.material=new THREE.MeshStandardMaterial({color:new THREE.Color(0x4f8cf7),metalness:.1,roughness:.2,side:THREE.DoubleSide});
+            setStInfo('已选中 '+entry.name+' 的面');
+        }
+        function closeProp(){document.getElementById('propPanel').style.display='none';bodyEntries.forEach(x=>x.mesh.material=getMat(modelColor));}
+        window.closeProp=closeProp;
+
+        /* ================= 工具按钮 ================= */
+        document.getElementById('fitBtn').onclick=()=>curInfo&&fit(Math.max(...curInfo.size));
+        document.getElementById('axisBtn').onclick=function(){axisG.visible=!axisG.visible;this.classList.toggle('active',axisG.visible);};
+        document.getElementById('isoBtn').onclick=()=>setView(.577,.577,.577);
+        document.getElementById('frontBtn').onclick=()=>setView(0,0,1);
+        document.getElementById('topBtn').onclick=()=>setView(0,1,0);
+        document.getElementById('leftBtn').onclick=()=>setView(1,0,0);
+        document.getElementById('rotateBtn').onclick=function(){controls.autoRotate=!controls.autoRotate;this.classList.toggle('active',controls.autoRotate);};
+        document.getElementById('gridBtn').onclick=function(){grid.visible=!grid.visible;this.classList.toggle('active',grid.visible);};
+        document.getElementById('wireBtn').onclick=function(){wireGroup.visible=!wireGroup.visible;this.classList.toggle('active',wireGroup.visible);modelGroup.traverse(c=>{if(c.material&&(c.material.isMeshStandardMaterial||c.material.isMeshPhysicalMaterial)){c.material.opacity=wireGroup.visible?0.12:1;c.material.transparent=wireGroup.visible;}});};
+        let panMode=false;
+        document.getElementById('panBtn').onclick=function(){
+            panMode=!panMode;this.classList.toggle('active',panMode);
+            controls.mouseButtons = panMode ? {LEFT:THREE.MOUSE.PAN, MIDDLE:THREE.MOUSE.DOLLY, RIGHT:THREE.MOUSE.ROTATE} : {LEFT:THREE.MOUSE.ROTATE, MIDDLE:THREE.MOUSE.DOLLY, RIGHT:THREE.MOUSE.PAN};
+            setStInfo(panMode?'✥ 平移模式：左键拖动平移（关闭旋转）':'操作模式：左键旋转');
+        };
+        let liveMode=false, liveMat=null;
+        function resetLive(){ if(liveMat){liveMat.dispose();liveMat=null;} bodyEntries.forEach(x=>{x.mesh.material=getMat(modelColor);}); }
+        function onLiveMove(e){
+            if(!curInfo)return;
+            const r=renderer.domElement.getBoundingClientRect();
+            const m=new THREE.Vector2(((e.clientX-r.left)/r.width)*2-1,-((e.clientY-r.top)/r.height)*2+1);
+            const ray=new THREE.Raycaster();ray.setFromCamera(m,camera);
+            const hits=ray.intersectObjects(clickableMeshes);
+            if(!hits.length){resetLive();return;}
+            const h=hits[0];const bi=h.object.userData.bodyIndex;const entry=bodyEntries[bi];if(!entry)return;
+            if(!liveMat){liveMat=new THREE.MeshStandardMaterial({color:new THREE.Color(0x4f8cf7),metalness:.1,roughness:.2,side:THREE.DoubleSide,transparent:true,opacity:.55});}
+            bodyEntries.forEach((x,xi)=>{x.mesh.material = (xi===bi)? liveMat : getMat(modelColor);});
+            setStInfo('◎ 悬停: '+entry.name+'  ('+h.point.x.toFixed(1)+', '+h.point.y.toFixed(1)+', '+h.point.z.toFixed(1)+')');
+        }
+        document.getElementById('liveBtn').onclick=function(){
+            liveMode=!liveMode;this.classList.toggle('active',liveMode);
+            if(liveMode){renderer.domElement.addEventListener('mousemove',onLiveMove);setStInfo('◎ 实时位置：移动鼠标高亮所在封闭面');}
+            else{renderer.domElement.removeEventListener('mousemove',onLiveMove);resetLive();setStInfo('实时位置已关闭');}
+        };
+        document.getElementById('edgeBtn').onclick=function(){edgeGroup.visible=!edgeGroup.visible;this.classList.toggle('active',edgeGroup.visible);};
+        document.getElementById('semiBtn').onclick=function(){const v=!this.classList.contains('active');this.classList.toggle('active',v);modelGroup.traverse(c=>{if(c.material&&(c.material.isMeshStandardMaterial||c.material.isMeshPhysicalMaterial)){c.material.opacity=v?.25:1;c.material.transparent=v;}});};
+        document.getElementById('matBtn').onclick=function(){
+            const cols=[[.78,.78,.80],[.6,.72,.85],[.85,.75,.65],[.72,.82,.72],[.9,.9,.9]];
+            const i=cols.findIndex(c=>modelColor[0]===c[0]);modelColor=cols[(i+1)%cols.length];
+            bodyEntries.forEach(e=>{e.mesh.material=getMat(modelColor);});
+        };
+        document.getElementById('showAllBtn').onclick=()=>{bodyEntries.forEach(e=>{e.visible=true;e.mesh.visible=true;});document.querySelectorAll('.tree-item .eye').forEach(x=>x.textContent='👁');refreshMarks();};
+        document.getElementById('hideAllBtn').onclick=()=>{bodyEntries.forEach(e=>{e.visible=false;e.mesh.visible=false;e.sgrp.visible=false;});document.querySelectorAll('.tree-item .eye').forEach(x=>x.textContent='🚫');refreshMarks();};
+        document.getElementById('viewcube').querySelectorAll('div').forEach(el=>el.onclick=()=>{
+            const v=el.dataset.v;
+            if(v==='front')setView(0,0,1);else if(v==='back')setView(0,0,-1);else if(v==='top')setView(0,1,0);else if(v==='bottom')setView(0,-1,0);else if(v==='left')setView(1,0,0);else if(v==='right')setView(-1,0,0);else if(v==='iso')setView(.577,.577,.577);else if(v==='reset'){if(curInfo)fit(Math.max(...curInfo.size));}else if(v==='home'){controls.autoRotate=!controls.autoRotate;document.getElementById('rotateBtn').classList.toggle('active',controls.autoRotate);}
+        });
+        document.addEventListener('keydown',e=>{
+            if(e.target.tagName==='INPUT'||e.target.tagName==='SELECT')return;
+            switch(e.key.toLowerCase()){
+                case 'w':document.getElementById('wireBtn').click();break;
+                case 'e':document.getElementById('edgeBtn').click();break;
+                case 's':document.getElementById('markBtn').click();break;
+                case 'f':document.getElementById('fitBtn').click();break;
+                case ' ':e.preventDefault();document.getElementById('rotateBtn').click();break;
+            }
+        });
+        window.addEventListener('resize',()=>{
+            const w=container.clientWidth,h=container.clientHeight;
+            renderer.setSize(w,h);composer.setSize(w,h);
+            camera.aspect=w/h;camera.updateProjectionMatrix();
+            const px=renderer.getPixelRatio();
+            fxaaPass.uniforms['resolution'].value.set(1/(w*px),1/(h*px));
+            updateEdgeLineResolution();
+        });
+
+        /* ================= 装配·拼合（独立渲染组，不干扰单模型视图） ================= */
+        const ASM_COLORS={punch:0x3a6fd8, product:0xff8c1a, cavity:0x2ea869};
+        const asmGroup=new THREE.Group(); scene.add(asmGroup);
+        let asmRoot=null;
+        let asmDragMode=false, asmDragPart=null, asmDragStartY=0, asmDragStartZ=0, asmDragSens=1;
+        const asmParts={};
+
+        function showAsmStatus(msg,type){const el=document.getElementById('asmStatus');if(!el)return;el.className='status-msg show '+(type||'info');el.textContent=msg;}
+        function asmStatusEl(key){return asmRoot?asmRoot.querySelector('.asm-st[data-st="'+key+'"]'):null;}
+        function setPartStatus(key,msg,type){const el=asmStatusEl(key);if(!el)return;el.className='status-msg show '+(type||'info');el.textContent=msg;}
+
+        function asmEdgesFlat(edges){
+            // 把 BREP 拓扑边采样折线拍平成"成对顶点"数组（与 LineSegments2 一致）
+            const pts=[]; let cnt=0; const MAX=200000;
+            for(const e of (edges||[])){
+                const v=e&&e.vertices; if(!v||v.length<6)continue;
+                for(let k=0;k+5<v.length && cnt<MAX;k+=3,cnt++)pts.push(v[k],v[k+1],v[k+2],v[k+3],v[k+4],v[k+5]);
+            }
+            return pts.length?new Float32Array(pts):null;
+        }
+
+        function buildAsmMesh(solid,key){
+            const verts=solid.vertices,tris=solid.triangles;
+            if(!verts||verts.length<3||!tris||tris.length<3)return null;
+            const geo=new THREE.BufferGeometry();
+            geo.setAttribute('position',new THREE.BufferAttribute(new Float32Array(verts),3));
+            geo.setIndex(new THREE.BufferAttribute(new Uint32Array(tris),1));
+            // 与单模型视图一致：顶点焊接缝合相邻面裂缝 + 法线分裂（硬边锐利、圆角平滑），
+            // 否则装配件曲面发平、接缝发噪、棱边被抹圆。任一步异常均回退，保证可见。
+            try{
+                weldBufferGeometry(geo, 1e-4);
+                computeSplitNormals(geo, 45);
+            }catch(e){
+                try{ geo.computeVertexNormals(); }catch(_){}
+            }
+            const col=ASM_COLORS[key]||0x888888;
+            // 半透明透视（默认）：不写深度以看清内部结构；polygonOffset 在"实体模式"下防止
+            // 特征线与表面共面产生 Z-fighting 闪烁。降低粗糙度 + 环境反射增强体积光泽。
+            const mat=new THREE.MeshStandardMaterial({color:col,side:THREE.DoubleSide,transparent:true,opacity:0.5,
+                roughness:0.5,metalness:0.05,envMapIntensity:0.4,depthWrite:false,
+                polygonOffset:true,polygonOffsetFactor:1,polygonOffsetUnits:1});
+            const mesh=new THREE.Mesh(geo,mat);
+            mesh.userData.asmKey=key;
+            const sub=new THREE.Group();
+            sub.userData.asmKey=key; sub.userData.meshRef=mesh;
+            sub.add(mesh);
+            // 特征边：优先用后端真实 BREP 拓扑边（完整圆盘/孔/切边），否则回退 EdgesGeometry。
+            // 用同色系深色细线勾勒轮廓，让零件"有骨有肉"，不再是纯色塑料块。
+            try{
+                let pa=asmEdgesFlat(solid.edges);
+                if(!pa){ const eg=new THREE.EdgesGeometry(geo,40); pa=eg.getAttribute('position').array; }
+                if(pa&&pa.length){
+                    const line=makeEdgeLine2(pa,new THREE.Color(col).multiplyScalar(0.6).getHex(),
+                        {transparent:true,opacity:0.85,linewidth:1.4,renderOrder:2});
+                    line.userData.asmKey=key;
+                    sub.add(line);
+                }
+            }catch(e){/* 特征边失败不影响部件显示 */}
+            return sub;
+        }
+
+        function addAsmPart(key,data){
+            if(asmParts[key]){asmGroup.remove(asmParts[key].group);}
+            const group=new THREE.Group();
+            const meshes=[];
+            (data.solids||[]).forEach(s=>{const sub=buildAsmMesh(s,key);if(sub){group.add(sub);const mm=sub.userData.meshRef;if(mm)meshes.push(mm);}});
+            const b=data.bbox||{min:[0,0,0],max:[0,0,0]};
+            asmParts[key]={group,meshes,data,b,baseZ:0,offset:0};
+            asmGroup.add(group);
+            updateAsmView();
+            // 加载后立即按分模面对齐，避免产品坐标偏置(如镜像后 z 很大)导致看不到
+            try{ if(asmGroup.children.length>0) arrangeAsm().catch(e=>{}); }catch(e){}
+        }
+
+        function updateAsmView(){
+            const has=asmGroup.children.length>0;
+            [modelGroup,surfaceGroup,bodyColGroup,edgeGroup,wireGroup].forEach(g=>{if(g)g.visible=!has;});
+        }
+
+        async function arrangeAsm(){
+            const keys=['punch','product','cavity'];
+            const present=keys.filter(k=>asmParts[k]);
+            if(!present.length){showAsmStatus('请先加载至少一个部件','err');return;}
+            // 说明：
+            //   首选【后端 BREP 精确自动对齐】：用真实质心+分模面计算每件位移，对任意
+            //   导入/任意坐标框架的 STEP 都能正确对准（产品/上/下模分模面共面、配合中心共轴），
+            //   彻底解决"下模 Y 错位 / 用户手动导入不同框架"问题。
+            //   仅当后端不可用（如文件不在服务器、无 filepath）才回退前端网格近似对齐。
+            const parts=present.map(k=>{
+                const p=asmParts[k];
+                const boxes=(p.meshes||[]).map(m=>{m.geometry.computeBoundingBox();return m.geometry.boundingBox.clone();});
+                if(!boxes.length)return null;
+                const ov=boxes.reduce((a,b)=>{a.union(b);return a;},new THREE.Box3().makeEmpty());
+                let mate,split;
+                if(k==='punch'){
+                    const core=boxes.reduce((a,b)=>(b.min.z<a.min.z?b:a),boxes[0]);
+                    mate=core.getCenter(new THREE.Vector3());
+                    split=core.max.z;
+                }else{
+                    mate=ov.getCenter(new THREE.Vector3());
+                    split=ov.max.z;
+                }
+                return {k,p,boxes,ov,mate,split};
+            }).filter(Boolean);
+            if(!parts.length){showAsmStatus('部件无可用网格','err');return;}
+
+            // —— 1) 优先：后端 BREP 精确自动对齐（支持任意框架导入） ——
+            const fp=p=>asmParts[p]&&asmParts[p].data&&asmParts[p].data.filepath;
+            const paths={punch:fp('punch'),product:fp('product'),cavity:fp('cavity')};
+            if(paths.punch&&paths.product&&paths.cavity){
+                try{
+                    const ctl=new AbortController();const timer=setTimeout(()=>ctl.abort(),120*1000);
+                    const resp=await fetch('/api/assembly_align',{method:'POST',
+                        headers:{'Content-Type':'application/json'},signal:ctl.signal,
+                        body:JSON.stringify({punch:paths.punch,product:paths.product,cavity:paths.cavity})});
+                    clearTimeout(timer);
+                    const d=await resp.json();
+                    if(!d.error&&d.offsets){
+                        // 应用后端位移：三件统一到基准(上模)的分模面+配合中心
+                        parts.forEach(it=>{
+                            const off=d.offsets[it.k];
+                            const dx=(off&&off[0])||0, dy=(off&&off[1])||0, dz=(off&&off[2])||0;
+                            it.p.group.position.set(dx,dy,dz);
+                            it.p.baseZ=dz; it.p.offset=0;
+                        });
+                        // 整体包围盒再居中到原点
+                        const gb=asmOffsetsGlobalBox(parts);
+                        if(!gb.isEmpty()){
+                            const c=gb.getCenter(new THREE.Vector3());
+                            parts.forEach(it=>{
+                                const p=it.p;
+                                p.group.position.x-=c.x;p.group.position.y-=c.y;p.group.position.z-=c.z;
+                                p.baseZ=p.group.position.z;
+                            });
+                        }
+                        const big=Math.max((gb.isEmpty()?300:gb.getSize(new THREE.Vector3()).length())*0.5,200);
+                        asmSetupSlider(big);
+                        fitAsm();
+                        showAsmStatus('已按分模面+配合中心自动对齐（自动检测任意框架）。滑条可上下拉开查看。','ok');
+                        return;
+                    }
+                }catch(e){ /* 后端对齐失败 -> 回退前端近似 */ }
+            }
+
+            // —— 2) 回退：前端网格近似对齐（同框架 0 平移；不同框架配合特征） ——
+            const splits=parts.map(it=>it.split);
+            const splitMax=Math.max(...splits), splitMin=Math.min(...splits);
+            const zTol=Math.max(2.0, (splitMax-splitMin)*0.05);
+            const sameFrame=present.length>=2 && (splitMax-splitMin)<=zTol;
+            if(sameFrame){
+                parts.forEach(it=>{const p=it.p;p.baseZ=0;p.offset=0;p.group.position.set(0,0,0);});
+            }else{
+                parts.forEach(it=>{const p=it.p;p.baseZ=-it.split;p.offset=0;
+                    p.group.position.set(-it.mate.x,-it.mate.y,p.baseZ);});
+            }
+            const gb=asmOffsetsGlobalBox(parts);
+            if(!gb.isEmpty()){
+                const c=gb.getCenter(new THREE.Vector3());
+                parts.forEach(it=>{const p=it.p;
+                    p.group.position.x-=c.x;p.group.position.y-=c.y;p.group.position.z-=c.z;
+                    p.baseZ=p.group.position.z;});
+            }
+            const big=Math.max((gb.isEmpty()?300:gb.getSize(new THREE.Vector3()).length())*0.5,200);
+            asmSetupSlider(big);
+            fitAsm();
+            showAsmStatus(sameFrame?'三件同框架：0 平移摆放（分模面一致已对齐）。滑动条可上下拉开查看。'
+                                  :'三件不同框架：已按配合特征近似对齐。','ok');
+        }
+
+        // 用已知实体包围盒平移后求并（避免矩阵未更新）
+        function asmOffsetsGlobalBox(parts){
+            let gb=new THREE.Box3().makeEmpty();
+            parts.forEach(it=>{
+                it.boxes.forEach(sb=>{
+                    const t=it.p.group.position;
+                    gb.union(new THREE.Box3(
+                        new THREE.Vector3(sb.min.x+t.x,sb.min.y+t.y,sb.min.z+t.z),
+                        new THREE.Vector3(sb.max.x+t.x,sb.max.y+t.y,sb.max.z+t.z)
+                    ));
+                });
+            });
+            return gb;
+        }
+        function asmSetupSlider(big){
+            if(asmRoot){
+                asmRoot.querySelectorAll('.asm-offset').forEach(sl=>{sl.min=-big;sl.max=big;sl.value=0;});
+                asmRoot.querySelectorAll('.asm-offv').forEach(v=>{v.textContent='0';});
+            }
+        }
+
+        function applyAsmOffset(key,val){
+            const p=asmParts[key];if(!p)return;
+            p.offset=parseFloat(val)||0;
+            p.group.position.z=p.baseZ+p.offset;
+            if(asmRoot){const v=asmRoot.querySelector('.asm-offv[data-offv="'+key+'"]');if(v)v.textContent=p.offset.toFixed(0);}
+        }
+
+        function setAsmTrans(key,on){
+            const p=asmParts[key];if(!p)return;
+            p.meshes.forEach(m=>{m.material.transparent=true;m.material.opacity=on?0.5:1;m.material.depthWrite=!on;});
+        }
+
+        function clearAsm(){
+            Object.keys(asmParts).forEach(k=>{asmGroup.remove(asmParts[k].group);});
+            for(const k in asmParts)delete asmParts[k];
+            if(asmRoot){
+                asmRoot.querySelectorAll('.asm-st').forEach(e=>{e.className='status-msg asm-st';e.textContent='';});
+                asmRoot.querySelectorAll('.asm-offset').forEach(e=>{e.value=0;});
+                asmRoot.querySelectorAll('.asm-offv').forEach(e=>{e.textContent='0';});
+            }
+            if(asmDragMode)setAsmDrag(false);
+            updateAsmView();
+            showAsmStatus('装配已清除。','info');
+        }
+
+        function fitAsm(){
+            const bb=new THREE.Box3().setFromObject(asmGroup);
+            if(bb.isEmpty())return;
+            const c=bb.getCenter(new THREE.Vector3());
+            const d=bb.getSize(new THREE.Vector3()).length()*1.4+10;
+            controls.target.copy(c);
+            camera.position.set(c.x+d*.7,c.y+d*.5,c.z+d);
+            controls.update();
+        }
+
+        function setAsmDrag(on){
+            asmDragMode=on;
+            const btn=document.getElementById('asmDrag');
+            if(btn){btn.textContent=on?'✥ 拖动模式：开（点住部件上下拖）':'✥ 拖动模式：关';btn.classList.toggle('active',on);}
+            // 拖动模式开启时禁用轨道控制，鼠标全部用于点选并上下拖拽部件，避免冲突
+            controls.enabled=!on;
+            if(!on)asmDragPart=null;
+        }
+
+        function onAsmPointerDown(e){
+            if(!asmDragMode)return;
+            const r=renderer.domElement.getBoundingClientRect();
+            const m=new THREE.Vector2(((e.clientX-r.left)/r.width)*2-1,-((e.clientY-r.top)/r.height)*2+1);
+            const ray=new THREE.Raycaster();ray.setFromCamera(m,camera);
+            const hits=ray.intersectObjects(asmGroup.children,true);
+            if(!hits.length)return;
+            const key=hits[0].object.userData.asmKey;
+            if(!key||!asmParts[key])return;
+            asmDragPart=key;asmDragStartY=e.clientY;
+            const p=asmParts[key];asmDragStartZ=p.baseZ+p.offset;
+            const dist=camera.position.distanceTo(controls.target)||1;
+            asmDragSens=2*dist*Math.tan(camera.fov*Math.PI/360)/Math.max(r.height,1);
+            renderer.domElement.setPointerCapture(e.pointerId);
+            e.preventDefault();
+        }
+        function onAsmPointerMove(e){
+            if(!asmDragPart||!asmParts[asmDragPart])return;
+            const dy=asmDragStartY-e.clientY;
+            const p=asmParts[asmDragPart];
+            const newOffset=asmDragStartZ+dy*asmDragSens-p.baseZ;
+            applyAsmOffset(asmDragPart,newOffset);
+            const sl=asmRoot?asmRoot.querySelector('.asm-offset[data-k="'+asmDragPart+'"]'):null;
+            if(sl)sl.value=Math.max(parseFloat(sl.min),Math.min(parseFloat(sl.max),newOffset));
+        }
+        function onAsmPointerUp(){asmDragPart=null;}
+        renderer.domElement.addEventListener('pointerdown',onAsmPointerDown);
+        renderer.domElement.addEventListener('pointermove',onAsmPointerMove);
+        renderer.domElement.addEventListener('pointerup',onAsmPointerUp);
+        renderer.domElement.addEventListener('pointercancel',onAsmPointerUp);
+
+        function loadAsmPartFromFile(key,file){
+            const ext=file.name.split('.').pop().toLowerCase();
+            if(!['stp','step','stl'].includes(ext)){setPartStatus(key,'仅支持 STP/STEP/STL','err');return;}
+            setPartStatus(key,'上传解析中...','info');
+            const ctl=new AbortController();const timer=setTimeout(()=>ctl.abort(),90*1000);
+            const fd=new FormData();fd.append('file',file);
+            fetch('/upload',{method:'POST',body:fd,signal:ctl.signal}).then(r=>r.json()).then(d=>{
+                clearTimeout(timer);
+                if(d.error)throw new Error(d.error);
+                addAsmPart(key,d);
+                setPartStatus(key,'已加载 '+(d.face_count||0)+' 个面','ok');
+                showAsmStatus('部件已载入：'+(d.file_name||key)+'（点「自动拼合」对齐）','info');
+            }).catch(e=>{clearTimeout(timer);setPartStatus(key,'失败:'+e.message,'err');});
+        }
+
+        function autoAsmPart(key){
+            let path=null;
+            // 上模/下模：优先用「模具再修理」的结果(_refixFiles)，其次第一次修复(_fixedFiles)，再次生成模具(_moldFiles)
+            const pick=(name)=>((window._refixFiles&&window._refixFiles[name])
+                                ||(window._fixedFiles&&window._fixedFiles[name])
+                                ||(window._moldFiles&&window._moldFiles[name])||null);
+            if(key==='punch')path=pick('punch');
+            else if(key==='cavity')path=pick('cavity');
+            else if(key==='product'){
+                // 产品必须与上/下模【同框架】才能正确对齐。从原始 fix_output 模具
+                //（PUNCH_FILLED/CAVITY_HOLLOWED，内含与模具同框架的产品实体）提取，
+                // 而不是用用户上传的镜像件（另一坐标框架，Y/Z 偏置数万 → 下模错位）。
+                const src=((window._fixedFiles&&window._fixedFiles.punch)
+                            ||(window._moldFiles&&window._moldFiles.punch)||null);
+                if(!src){setPartStatus('product','无原始模具(含同框架产品)，请先生成/修复模具','err');return;}
+                setPartStatus('product','从原始模具提取同框架产品...','info');
+                fetch('/api/assembly_product_mesh?file='+encodeURIComponent(src)).then(r=>r.json()).then(d=>{
+                    if(d.error)throw new Error(d.error);
+                    addAsmPart('product',d);
+                    setPartStatus('product','已加载同框架产品 '+(d.face_count||0)+' 面','ok');
+                    showAsmStatus('产品已从原始模具提取同框架实体（点「自动拼合」对齐）','info');
+                }).catch(e=>setPartStatus('product','失败:'+e.message,'err'));
+                return;
+            }
+            if(!path){setPartStatus(key,'无可用文件（请先上传产品 / 生成模具 / 再修理模具）','err');return;}
+            setPartStatus(key,'加载中...','info');
+            fetch('/api/mesh?file='+encodeURIComponent(path)).then(r=>r.json()).then(d=>{
+                if(d.error)throw new Error(d.error);
+                addAsmPart(key,d);
+                setPartStatus(key,'已加载 '+(d.face_count||0)+' 个面','ok');
+                showAsmStatus('部件已载入（点「自动拼合」对齐）','info');
+            }).catch(e=>setPartStatus(key,'失败:'+e.message,'err'));
+        }
+
+        /* ================= 工程面板 ================= */
+        const PANELS={
+            upload:{t:'📂 上传 3D 模型',html:()=>`
+                <div style="border:2px dashed var(--border);border-radius:10px;padding:26px 16px;text-align:center;cursor:pointer" id="upArea">
+                    <div style="font-size:34px">📁</div><div style="font-size:14px;font-weight:600;margin-top:6px">点击或拖拽文件到此处</div>
+                    <div style="font-size:11.5px;color:var(--text3);margin-top:4px">支持 .stp .step .stl</div>
+                    <input type="file" id="upFile" accept=".stp,.step,.stl" style="display:none">
+                </div>
+                <button class="btn" id="upBtn">⬆️ 上传并查看</button>
+                <div class="status-msg" id="panelStatus"></div>`},
+            measure:{t:'📏 测量工具',html:()=>`
+                <label class="f">测量类型</label>
+                <select id="msType"><option>距离</option><option>连续长度</option></select>
+                <button class="btn" id="msStart">🎯 开始测量</button>
+                <button class="btn small" id="msClear" style="margin-top:6px">🗑️ 清除</button>
+                <div class="hint">点击模型上的两个点测量距离, 再次点击记录.</div>
+                <div class="status-msg" id="panelStatus" style="display:block;font-weight:600;background:var(--primary-bg);color:var(--primary-dark);border:1px solid #c9ddfd">当前值: —</div>`},
+            cutplane:{t:'✂️ 剖切面分析',html:()=>`
+                <label class="f">方向</label>
+                <select id="cpDir"><option value="z">Z 水平</option><option value="y">Y 竖直</option><option value="x">X 纵深</option></select>
+                <label class="f">深度位置: <span id="cpV">0.0</span> mm</label>
+                <input type="range" id="cpRange" min="0" max="1000" value="500" style="width:100%">
+                <button class="btn" id="cpBtn">✂️ 计算截面展开长度</button>
+                <div class="status-msg" id="panelStatus"></div>`},
+            mold:{t:'🔨 模具·修复',html:()=>`
+                <label class="f">基底厚度</label><input type="number" id="mdThick" value="10" min="2" max="100">
+                <label class="f">产品留边</label><input type="number" id="mdMargin" value="10" min="2" max="100">
+                <button class="btn" id="mdGen">🔨 生成上下模具</button>
+                <div class="status-msg" id="panelStatus"></div>
+                <div style="font-size:12px;background:var(--primary-bg);border-radius:7px;padding:8px;margin-top:12px;color:var(--primary-dark)" id="mdRes"></div>
+                <hr style="border:none;border-top:1px solid var(--border);margin:13px 0">
+                <label class="f">模具修复对象</label>
+                <select id="fxTarget"><option value="">— 选择 —</option><option value="punch">凸模 — 补齐</option><option value="cavity">凹模 — 挖空</option></select>
+                <button class="btn" id="fxBtn">🔧 执行修复</button>
+                <div class="status-msg" id="panelStatus2"></div>
+                <a class="btn" id="fxLink" style="display:none;text-decoration:none" target="_blank">⬇️ 下载修复后模型</a>`},
+            mirror:{t:'🪞 镜像与旋转',html:()=>`
+                <div class="hint">【镜像】关于坐标面生成对称件；【旋转】绕 X/Y/Z 轴顺/逆时针旋转后下载导出调整后的产品。</div>
+                <label class="f">镜像平面</label>
+                <select id="mrPlane"><option value="xOy">XOY 面</option><option value="xOz">XOZ 面</option><option value="yOz">YOZ 面</option></select>
+                <label style="display:flex;align-items:center;gap:6px;font-size:13px;margin-top:8px"><input type="checkbox" id="mrCenter" checked> 镜像面经过质心</label>
+                <button class="btn" id="mrBtn">🪞 生成镜像模型</button>
+                <div class="status-msg" id="panelStatus"></div>
+                <a class="btn" id="mrLink" style="display:none;text-decoration:none" target="_blank">⬇️ 下载镜像模型</a>
+                <hr style="margin:14px 0;border:none;border-top:1px solid rgba(255,255,255,.12)">
+                <label class="f">旋转轴</label>
+                <select id="rotAxis"><option value="x">X 轴</option><option value="y">Y 轴</option><option value="z" selected>Z 轴</option></select>
+                <label class="f">旋转方向</label>
+                <select id="rotDir"><option value="cw" selected>顺时针 (CW)</option><option value="ccw">逆时针 (CCW)</option></select>
+                <label class="f">旋转角度 (度)</label>
+                <input type="number" id="rotAngle" value="30" min="0" max="360" step="1">
+                <label style="display:flex;align-items:center;gap:6px;font-size:13px;margin-top:8px"><input type="checkbox" id="rotCenter" checked> 旋转轴经过质心</label>
+                <button class="btn" id="rotBtn">⟳ 旋转产品</button>
+                <div class="status-msg" id="panelStatusRot"></div>
+                <a class="btn" id="rotLink" style="display:none;text-decoration:none" target="_blank">⬇️ 下载旋转后产品</a>`},
+            corner:{t:'🔧 角落自动闭合补齐',html:()=>`
+                <div class="hint">识别钣金件角落开放缺口并自动延伸两侧边缘线求交点，生成与原板厚一致的尖角楔形补片（默认 sharp_closed 尖角闭合）。<br>· 先「检测」查看间隙列表，再「修复」补齐角落；<br>· 间隙过大时请适当增大「最大延伸距离」。</div>
+                <label class="f">最大延伸距离 extend (mm)</label><input type="number" id="ccExtend" value="6" min="0.5" step="0.5">
+                <label class="f">间隙阈值 gap_tol (mm)</label><input type="number" id="ccGapTol" value="0.15" min="0.01" step="0.01">
+                <label class="f">闭合模式</label>
+                <select id="ccMode"><option value="sharp_closed">尖角闭合 sharp</option><option value="butt">平面对接 butt</option><option value="overlap">重叠 overlap</option></select>
+                <button class="btn" id="ccCheck">🔍 检测角落间隙</button>
+                <button class="btn" id="ccFix">🛠 执行角落闭合修复</button>
+                <div class="status-msg" id="panelStatus"></div>
+                <div style="font-size:12px;background:var(--primary-bg);border-radius:7px;padding:8px;margin-top:12px;color:var(--primary-dark)" id="ccRes"></div>
+                <a class="btn" id="ccLink" style="display:none;text-decoration:none" target="_blank">⬇️ 下载角落闭合后模型</a>`},
+            assembly:{t:'🧩 装配·拼合',html:()=>`
+                <div class="hint">将 上模 / 产品 / 下模 三个结构体拼合查看贴合效果：<br>· 每个部件可【选择文件】或【自动】填入本会话生成的模具<br>· 「自动拼合」按分模面对齐（凸模底面 = 分模面 = 产品/凹模顶面）<br>· 勾选「半透明」透视内部；滑条或「拖动模式」可上下拉开/合拢<br>· 「输出装配体(STEP)」→ 生成一个可下载、已合拢插合贴面无干涉的整体装配文件</div>
+                <div class="asm-part">
+                    <label class="f">🔺 上模（凸模 · 修复后）</label>
+                    <div style="display:flex;gap:6px">
+                        <button class="btn small" data-k="punch" data-act="pick" style="flex:1;margin-top:0">选择文件</button>
+                        <button class="btn small" data-k="punch" data-act="auto" style="flex:1;margin-top:0">自动</button>
+                    </div>
+                    <input type="file" class="asm-file" data-k="punch" accept=".stp,.step,.stl" style="display:none">
+                    <div class="status-msg asm-st" data-st="punch"></div>
+                    <label class="asm-row"><input type="checkbox" class="asm-trans" data-k="punch" checked> 半透明（透视）</label>
+                    <label class="f">上模 上下偏移：<span class="asm-offv" data-offv="punch">0</span> mm</label>
+                    <input type="range" class="asm-offset" data-k="punch" min="-300" max="300" value="0" step="1" style="width:100%">
+                </div>
+                <div class="asm-part">
+                    <label class="f">🔻 产品（钣金件）</label>
+                    <div style="display:flex;gap:6px">
+                        <button class="btn small" data-k="product" data-act="pick" style="flex:1;margin-top:0">选择文件</button>
+                        <button class="btn small" data-k="product" data-act="auto" style="flex:1;margin-top:0">自动</button>
+                    </div>
+                    <input type="file" class="asm-file" data-k="product" accept=".stp,.step,.stl" style="display:none">
+                    <div class="status-msg asm-st" data-st="product"></div>
+                    <label class="asm-row"><input type="checkbox" class="asm-trans" data-k="product" checked> 半透明（透视）</label>
+                    <label class="f">产品 上下偏移：<span class="asm-offv" data-offv="product">0</span> mm</label>
+                    <input type="range" class="asm-offset" data-k="product" min="-300" max="300" value="0" step="1" style="width:100%">
+                </div>
+                <div class="asm-part">
+                    <label class="f">🔻 下模（凹模 · 修复后）</label>
+                    <div style="display:flex;gap:6px">
+                        <button class="btn small" data-k="cavity" data-act="pick" style="flex:1;margin-top:0">选择文件</button>
+                        <button class="btn small" data-k="cavity" data-act="auto" style="flex:1;margin-top:0">自动</button>
+                    </div>
+                    <input type="file" class="asm-file" data-k="cavity" accept=".stp,.step,.stl" style="display:none">
+                    <div class="status-msg asm-st" data-st="cavity"></div>
+                    <label class="asm-row"><input type="checkbox" class="asm-trans" data-k="cavity" checked> 半透明（透视）</label>
+                    <label class="f">下模 上下偏移：<span class="asm-offv" data-offv="cavity">0</span> mm</label>
+                    <input type="range" class="asm-offset" data-k="cavity" min="-300" max="300" value="0" step="1" style="width:100%">
+                </div>
+                <button class="btn" id="asmAssemble">🧩 自动拼合</button>
+                <button class="btn" id="asmDrag">✥ 拖动模式：关</button>
+                <button class="btn" id="asmClear">🗑 清除装配</button>
+                <button class="btn" id="asmBuild" style="margin-top:6px">📦 输出装配体(STEP)</button>
+                <div class="status-msg" id="asmBuildStatus" style="display:block;font-size:11.5px"></div>
+                <a class="btn" id="asmBuildLink" style="display:none;text-decoration:none;margin-top:6px" target="_blank">⬇️ 下载装配体（合拢）</a>
+                <div class="status-msg" id="asmStatus"></div>`},
+            refix:{t:'🛠 模具再修理（去除产品结构体）',html:()=>`
+                <div class="hint">在第一次修复（PUNCH_FILLED / CAVITY_HOLLOWED）基础上二次修复：<br>· 自动剔除上下模内的「产品」结构体，保留 上模=[基座,凸起台]、下模=[型腔]。<br>请分别选择【修理后的上模】与【修理后的下模】两个 STEP。</div>
+                <label class="f">🔺 上模（凸模 · 第一次修复后）</label>
+                <input type="file" id="rxPunch" accept=".stp,.step" style="width:100%">
+                <label class="f">🔻 下模（凹模 · 第一次修复后）</label>
+                <input type="file" id="rxCavity" accept=".stp,.step" style="width:100%">
+                <button class="btn" id="rxBtn">🛠 执行再修理</button>
+                <div class="status-msg" id="panelStatus"></div>
+                <div style="font-size:12px;background:var(--primary-bg);border-radius:7px;padding:8px;margin-top:12px;color:var(--primary-dark)" id="rxRes"></div>
+                <a class="btn" id="rxPunchLink" style="display:none;text-decoration:none" target="_blank">⬇️ 下载再修理上模</a>
+                <a class="btn" id="rxCavityLink" style="display:none;text-decoration:none" target="_blank">⬇️ 下载再修理下模</a>`},
+            contact:{t:'📐 提取形变配合面（根据产品）',html:()=>`
+                <div class="hint">直接【根据产品】STEP 提取形变配合面：凸模配合面 = 产品【上表面】；凹模配合面 = 产品【下表面】。形变面即产品自身的形变区域，无需先生成模具。</div>
+                <label class="f">📦 产品（.stp/.step）</label>
+                <input type="file" id="cfProduct" accept=".stp,.step" style="width:100%">
+                <div style="display:flex;gap:10px;flex-wrap:wrap;align-items:center;margin-top:6px">
+                    <label class="f" style="margin:0"><input type="checkbox" id="cfExport" checked> 导出STEP</label>
+                </div>
+                <button class="btn" id="cfBtn">📐 提取形变配合面</button>
+                <div class="status-msg" id="panelStatus"></div>
+                <div style="font-size:12px;background:var(--primary-bg);border-radius:7px;padding:8px;margin-top:12px;color:var(--primary-dark)" id="cfRes"></div>
+                <a class="btn" id="cfPunchLink" style="display:none;text-decoration:none" target="_blank">⬇️ 下载凸模配合面 STEP</a>
+                <a class="btn" id="cfCavityLink" style="display:none;text-decoration:none" target="_blank">⬇️ 下载凹模配合面 STEP</a>
+                <a class="btn" id="cfReportLink" style="display:none;text-decoration:none" target="_blank">⬇️ 下载 JSON 报告</a>`},
+            m2:{t:'🏭 模具自动生成（多方法）',html:()=>`
+                <div class="hint">选输入 → 勾方法（可多选做对比）→ 生成。每个方法都会出上下模，并用<b>同一套指标</b>自动校验：实体数/壳数、BRepCheck 有效性、上下模干涉、与形变面贴合度、与产品贴合。新增方法只写 Python，不用改这个界面。</div>
+                <label class="f">⭐ 产品实体 STEP <span style="color:#888">（方法二B / 四 / 五 需要）</span></label>
+                <input type="file" id="mkProduct" accept=".stp,.step" style="width:100%">
+                <label class="f">🔺 上形变面 STEP <span style="color:#888">（方法二A / 三 需要）</span></label>
+                <input type="file" id="mkUpper" accept=".stp,.step" style="width:100%">
+                <label class="f">🔻 下形变面 STEP</label>
+                <input type="file" id="mkLower" accept=".stp,.step" style="width:100%">
+                <div id="mkExtra"></div>
+                <label class="f">零件名（输出文件前缀）</label>
+                <input type="text" id="mkName" placeholder="留空自动" style="width:100%">
+                <div style="border-top:1px dashed var(--border);margin:12px 0"></div>
+                <label class="f">选择方法</label>
+                <div id="mkMethods" style="font-size:12.5px;line-height:1.9">加载中…</div>
+                <div id="mkParams"></div>
+                <button class="btn" id="mkRun">🏭 按所选方法生成</button>
+                <button class="btn" id="mkAll" style="margin-top:6px;background:#546e7a">🏁 所有可用方法都跑一遍对比</button>
+                <div id="mkSummary" style="font-size:12px;margin-top:10px"></div>
+                <div id="mkArts" style="margin-top:8px;font-size:12px"></div>
+                <pre id="mkLog" style="max-height:220px;overflow:auto;font-size:11px;background:#f7f7f7;border:1px solid var(--border);border-radius:6px;padding:8px;white-space:pre-wrap;margin-top:8px">等待开始</pre>
+                <div style="border-top:1px dashed var(--border);margin:14px 0"></div>
+                <div class="hint">—— 以下为原来的「法二」单独入口，逻辑未改动 ——</div>
+                <label class="f">⭐ 产品（法二B·推荐）</label>
+                <input type="file" id="m2Product" accept=".stp,.step" style="width:100%">
+                <label class="f">🔺 上形变面（法二A·可选）</label>
+                <input type="file" id="m2Upper" accept=".stp,.step" style="width:100%">
+                <label class="f">🔻 下形变面（法二A·可选）</label>
+                <input type="file" id="m2Lower" accept=".stp,.step" style="width:100%">
+                <div style="display:flex;gap:10px;flex-wrap:wrap;align-items:center;margin-top:6px">
+                    <label class="f" style="margin:0">上模填充h1 <input type="number" id="m2H1" placeholder="自动" style="width:70px"></label>
+                    <label class="f" style="margin:0">空腔高 <input type="number" id="m2Hc" placeholder="自动" style="width:70px"></label>
+                    <label class="f" style="margin:0">基座长X <input type="number" id="m2Lx" placeholder="自动" style="width:80px"></label>
+                    <label class="f" style="margin:0">宽Y <input type="number" id="m2Ly" placeholder="自动" style="width:80px"></label>
+                    <label class="f" style="margin:0">高Z <input type="number" id="m2Hz" placeholder="自动" style="width:80px"></label>
+                    <label class="f" style="margin:0">边距 <input type="number" id="m2Mg" value="5" step="0.5" style="width:60px"></label>
+                    <label class="f" style="margin:0"><input type="checkbox" id="m2Export" checked> 导出STEP</label>
+                </div>
+                <button class="btn" id="m2Btn" style="background:#8d6e63">🛠 生成上/下模（法二）</button>
+                <div class="status-msg" id="panelStatus"></div>
+                <div style="font-size:12px;background:var(--primary-bg);border-radius:7px;padding:8px;margin-top:12px;color:var(--primary-dark)" id="m2Res"></div>
+                <a class="btn" id="m2PunchLink" style="display:none;text-decoration:none" target="_blank">⬇️ 下载上模 STEP</a>
+                <a class="btn" id="m2CavityLink" style="display:none;text-decoration:none" target="_blank">⬇️ 下载下模 STEP</a>`},
+            holefill:{t:'🕳 孔洞补齐',html:()=>`
+                <div class="hint">自动识别导入模型上的所有孔洞（圆形穿孔/盲孔），并自动补齐至与钣金两面【平齐、无超出】。<br>· 遍历所有 360° 完整圆柱面识别孔壁（自动排除折弯圆角）；<br>· 每个孔生成恰好贴合两端面的圆柱补实体并布尔融合；<br>· 识别数为 0 说明模型没有圆形孔（折弯圆角不会误判）。</div>
+                <button class="btn" id="hfBtn">🕳 自动补齐所有孔洞</button>
+                <div class="status-msg" id="panelStatus"></div>
+                <div style="font-size:12px;background:var(--primary-bg);border-radius:7px;padding:8px;margin-top:12px;color:var(--primary-dark)" id="hfRes"></div>
+                <a class="btn" id="hfLink" style="display:none;text-decoration:none" target="_blank">⬇️ 下载补齐后模型</a>`},
+        };
+        /* ============ 多面板管理：支持同时打开多个功能面板，各自保留状态 ============ */
+        const panelEl = document.getElementById('panels');
+        const backdropEl = document.getElementById('panelBackdrop');
+        const panelStack = document.getElementById('panelStack');
+        const openPanels = new Set();    // 当前打开的面板名集合
+        const builtPanels = new Set();   // 已构建过（首次打开过）的面板名 —— 之后保留其 DOM 与状态
+
+        function buildPanel(name){
+            const p=PANELS[name];if(!p)return;
+            if(builtPanels.has(name))return;   // 面板只构建一次，避免重复绑定/状态被清空
+            const card=document.createElement('div');
+            card.className='panel-card';
+            card.dataset.panel=name;
+            card.innerHTML='<div class="ph">'+p.t+'<button title="关闭该面板" data-act="close">✕</button></div><div class="pb"></div>';
+            card.querySelector('[data-act="close"]').onclick=()=>closePanel(name);
+            const body=card.querySelector('.pb');
+            body.innerHTML=p.html();
+            panelStack.appendChild(card);
+            builtPanels.add(name);
+            bindPanel(name, body);   // 元素查找限定在该面板 body 内，规避多面板重复 id 冲突
+        }
+        function openPanel(name){
+            const p=PANELS[name];if(!p)return;
+            buildPanel(name);
+            const card=panelStack.querySelector('.panel-card[data-panel="'+name+'"]');
+            if(card)card.classList.add('show');
+            openPanels.add(name);
+            panelEl.classList.add('show');
+            backdropEl.classList.add('show');
+            document.querySelectorAll('.ha-btn').forEach(b=>b.classList.toggle('active',openPanels.has(b.dataset.panel)));
+            document.querySelectorAll('.fn-btn').forEach(b=>b.classList.toggle('active',openPanels.has(b.dataset.panel)));
+        }
+        function closePanel(name){
+            if(name && openPanels.has(name)){
+                openPanels.delete(name);
+                const card=panelStack.querySelector('.panel-card[data-panel="'+name+'"]');
+                if(card)card.classList.remove('show');
+                document.querySelectorAll('.ha-btn').forEach(b=>b.classList.toggle('active',openPanels.has(b.dataset.panel)));
+                document.querySelectorAll('.fn-btn').forEach(b=>b.classList.toggle('active',openPanels.has(b.dataset.panel)));
+                if(!openPanels.size){panelEl.classList.remove('show');backdropEl.classList.remove('show');}
+                return;
+            }
+            if(!name)closeAllPanels();
+        }
+        function closeAllPanels(){
+            openPanels.clear();
+            panelStack.querySelectorAll('.panel-card.show').forEach(c=>c.classList.remove('show'));
+            panelEl.classList.remove('show');
+            backdropEl.classList.remove('show');
+            document.querySelectorAll('.ha-btn').forEach(b=>b.classList.remove('active'));
+            document.querySelectorAll('.fn-btn').forEach(b=>b.classList.remove('active'));
+        }
+        window.closeAllPanels=closeAllPanels;
+        window.closePanel=closePanel;
+        document.addEventListener('keydown',e=>{
+            if(e.key==='Escape'&&panelEl.classList.contains('show')){closeAllPanels();e.stopPropagation();}
+        });
+        function togglePanel(name){
+            if(openPanels.has(name))closePanel(name);
+            else openPanel(name);
+        }
+        document.querySelectorAll('.ha-btn').forEach(b=>b.onclick=()=>togglePanel(b.dataset.panel));
+        document.querySelectorAll('.fn-btn').forEach(b=>b.onclick=()=>togglePanel(b.dataset.panel));
+
+        // === 运行后自动清理中间产物 开关 ===
+        const autoCleanChk=document.getElementById('autoCleanChk');
+        if(autoCleanChk){
+            fetch('/api/auto_clean',{method:'GET'}).then(r=>r.json()).then(d=>{
+                autoCleanChk.checked=!!d.enabled;
+            }).catch(()=>{ autoCleanChk.checked=true; });
+            autoCleanChk.onchange=async()=>{
+                try{
+                    await fetch('/api/auto_clean',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({enabled:autoCleanChk.checked})});
+                }catch(e){ showStatus('开关设置失败:'+e.message,'err',panelEl.querySelector('#panelStatus')||null); }
+            };
+        }
+
+        function bindPanel(name, root){
+            // 作用域化查找：元素都在该面板 card 的 body(root) 内查找，
+            // 这样多个面板同时存在于 DOM 时各自重复的 id 不会互相干扰。
+            const $=id=>root.querySelector('#'+id);
+            if(name==='upload'){
+                const area=$('upArea'),file=$('upFile');
+                area.onclick=()=>file.click();
+                area.ondragover=e=>{e.preventDefault();area.style.borderColor='var(--primary)';};
+                area.ondrop=e=>{e.preventDefault();if(e.dataTransfer.files.length)doUpload(e.dataTransfer.files[0],$('panelStatus'));};
+                file.onchange=()=>file.files.length&&doUpload(file.files[0],$('panelStatus'));
+            }
+            if(name==='measure'){
+                let pts=[];const ln=new THREE.Group();scene.add(ln);
+                const startBtn=$('msStart');
+                const statusEl=$('panelStatus');
+                const doStart=()=>{
+                    pts=[];
+                    if(!openPanels.has('measure'))return;
+                    startBtn.textContent='🔴 测量中...';
+                    const onC=e=>{
+                        const r=renderer.domElement.getBoundingClientRect();const m=new THREE.Vector2(((e.clientX-r.left)/r.width)*2-1,-((e.clientY-r.top)/r.height)*2+1);
+                        const ray=new THREE.Raycaster();ray.setFromCamera(m,camera);const hits=ray.intersectObjects(clickableMeshes);
+                        if(!hits.length)return;
+                        const p=hits[0].point.clone();pts.push(p);
+                        const sp=new THREE.Mesh(new THREE.SphereGeometry(1.6,12,12),new THREE.MeshBasicMaterial({color:0x4f8cf7}));sp.position.copy(p);scene.add(sp);ln.add(sp);
+                        if(pts.length>=2){
+                            const d=pts[pts.length-2].distanceTo(pts[pts.length-1]);
+                            const lg=new THREE.BufferGeometry().setFromPoints([pts[pts.length-2],pts[pts.length-1]]);
+                            const line=new THREE.Line(lg,new THREE.LineDashedMaterial({color:0x4f8cf7,dashSize:2,gapSize:1.5}));line.computeLineDistances();scene.add(line);ln.add(line);
+                            const cc=document.createElement('canvas');cc.width=256;cc.height=64;const c2=cc.getContext('2d');c2.fillStyle='rgba(255,255,255,.9)';c2.fillRect(0,0,256,64);c2.strokeStyle='#4f8cf7';c2.lineWidth=2;c2.strokeRect(0,0,256,64);c2.fillStyle='#4f8cf7';c2.font='Bold 26px Arial';c2.textAlign='center';c2.textBaseline='middle';c2.fillText(d.toFixed(2)+' mm',128,34);
+                            const tx=new THREE.CanvasTexture(cc),lab=new THREE.Sprite(new THREE.SpriteMaterial({map:tx}));lab.scale.set(24,6,1);lab.position.copy(pts[pts.length-2].clone().add(pts[pts.length-1]).multiplyScalar(.5)).add(new THREE.Vector3(0,5,0));scene.add(lab);ln.add(lab);
+                            statusEl.textContent='长度 '+d.toFixed(2)+' mm（已记录）';
+                        }
+                    };
+                    renderer.domElement.addEventListener('click',onC);
+                    renderer.domElement.onmousemove=e=>{const r=renderer.domElement.getBoundingClientRect();const m=new THREE.Vector2(((e.clientX-r.left)/r.width)*2-1,-((e.clientY-r.top)/r.height)*2+1);const ray=new THREE.Raycaster();ray.setFromCamera(m,camera);renderer.domElement.style.cursor=ray.intersectObjects(clickableMeshes).length?'crosshair':'default';};
+                    window._stopMs=()=>{renderer.domElement.removeEventListener('click',onC);startBtn.textContent='🎯 开始测量';};
+                };
+                startBtn.onclick=()=>{if(startBtn.textContent.includes('测量中')){window._stopMs&&window._stopMs();}else doStart();};
+                $('msClear').onclick=()=>{window._stopMs&&window._stopMs();while(ln.children.length){const c=ln.children[0];if(c.geometry)c.geometry.dispose();scene.remove(c);ln.remove(c);}statusEl.textContent='当前值: —';};
+            }
+            if(name==='cutplane'){
+                const dirSel=$('cpDir'),rng=$('cpRange'),v=$('cpV');
+                rng.oninput=()=>{v.textContent=(parseFloat(rng.value)/500*100).toFixed(1);};
+                $('cpBtn').onclick=async()=>{
+                    if(!curModelPath){showStatus('请先上传模型','err',$('panelStatus'));return;}
+                    const dir=dirSel.value,norm=dir==='z'?[0,0,1]:dir==='y'?[0,1,0]:[1,0,0];
+                    const frac=parseFloat(rng.value)/1000;
+                    const bb=new THREE.Box3().setFromObject(modelGroup);
+                    const min=bb.min,max=bb.max;
+                    const origin=[(min.x+max.x)/2,(min.y+max.y)/2,(min.z+max.z)/2];
+                    origin[dir==='z'?2:dir==='y'?1:0]=min[dir==='z'?2:dir==='y'?1:0]+(max[dir==='z'?2:dir==='y'?1:0]-min[dir==='z'?2:dir==='y'?1:0])*frac;
+                    showStatus('计算中...','info',$('panelStatus'));
+                    try{
+                        const resp=await fetch('/api/slice_plane?file='+encodeURIComponent(curModelPath)+'&origin='+origin.map(o=>o.toFixed(3)).join(',')+'&normal='+norm.join(','));
+                        const data=await resp.json();if(data.error)throw new Error(data.error);
+                        showStatus('展开长度 '+(data.best_length||data.arc_lengths?.reduce((a,b)=>a+b,0)||0).toFixed(2)+' mm（'+(data.contours_3d?.length||0)+' 条轮廓）','ok',$('panelStatus'));
+                    }catch(e){showStatus('失败: '+e.message,'err',$('panelStatus'));}
+                };
+            }
+            if(name==='mold'){
+                const st1=$('panelStatus'),st2=$('panelStatus2');
+                $('mdGen').onclick=async()=>{
+                    if(!curModelPath){showStatus('请先上传模型','err',st1);return;}
+                    showStatus('生成中（30秒-2分钟）...','info',st1);
+                    try{
+                        const resp=await fetch('/api/generate_mold',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({filepath:curModelPath,side_margin:parseFloat($('mdMargin').value)||10,base_thickness:parseFloat($('mdThick').value)||10})});
+                        const d=await resp.json();if(d.error)throw new Error(d.error);
+                        const inf=d.info;
+                        $('mdRes').innerHTML='✅ 模具已生成<br>📦 产品 '+inf.product_size[0].toFixed(0)+'×'+inf.product_size[1].toFixed(0)+'×'+inf.product_size[2].toFixed(0)+' mm<br>🔻 凹模 '+inf.cavity_size[0].toFixed(0)+'×'+inf.cavity_size[1].toFixed(0)+'×'+inf.cavity_size[2].toFixed(0)+' mm<br>🔺 凸模 '+inf.punch_size[0].toFixed(0)+'×'+inf.punch_size[1].toFixed(0)+'×'+inf.punch_size[2].toFixed(0)+' mm<br><a href="/api/download_mold?file='+encodeURIComponent(d.cavity)+'" style="color:var(--primary)">⬇️ 凹模</a> &nbsp; <a href="/api/download_mold?file='+encodeURIComponent(d.punch)+'" style="color:var(--primary)">⬇️ 凸模</a>';
+                        showStatus('模具生成完成！','ok',st1);
+                        window._moldFiles={cavity:d.cavity,punch:d.punch};
+                    }catch(e){showStatus('失败:'+e.message,'err',st1);}
+                };
+                $('fxBtn').onclick=async()=>{
+                    const t=$('fxTarget').value;if(!t){showStatus('请选择修复对象','err',st2);return;}
+                    const f=window._moldFiles?window._moldFiles[t]:null;if(!f){showStatus('请先生成模具','err',st2);return;}
+                    const btn=$('fxBtn');
+                    btn.disabled=true;btn.textContent='⏳ 修复中...';
+                    showStatus('修复中...（凸模补齐约 2~4 分钟，凹模挖空约 1~2 分钟，请耐心等待）','info',st2);
+                    $('fxLink').style.display='none';
+                    const ctl=new AbortController();
+                    const timer=setTimeout(()=>ctl.abort(),600*1000);
+                    try{
+                        const resp=await fetch('/api/fix_mold',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({filepath:f,operation:t==='punch'?'fill':'hollow',product_filepath:curModelPath}),signal:ctl.signal});
+                        const d=await resp.json();if(d.error)throw new Error(d.error);
+                        const l=$('fxLink');l.href='/api/download_fix?file='+encodeURIComponent(d.output_path);l.style.display='block';
+                        showStatus('修复完成！','ok',st2);
+                        window._fixedFiles=window._fixedFiles||{};window._fixedFiles[t]=d.output_path;
+                    }catch(e){
+                        if(e.name==='AbortError')showStatus('❌ 修复超时（超过10分钟）。请确认服务器正在运行，或在 fix_output 目录查看是否已生成文件','err',st2);
+                        else showStatus('失败: '+e.message,'err',st2);
+                    }finally{
+                        clearTimeout(timer);
+                        btn.disabled=false;btn.textContent='🔧 执行修复';
+                    }
+                };
+            }
+            if(name==='mirror'){
+                $('mrBtn').onclick=async()=>{
+                    if(!curModelPath){showStatus('请先上传模型','err',$('panelStatus'));return;}
+                    showStatus('生成中...','info',$('panelStatus'));
+                    try{
+                        const resp=await fetch('/api/generate_mirror',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({filepath:curModelPath,plane:$('mrPlane').value,center_on_centroid:$('mrCenter').checked})});
+                        const d=await resp.json();if(d.error)throw new Error(d.error);
+                        const l=$('mrLink');l.href='/api/download_mirror?file='+encodeURIComponent(d.output_path);l.style.display='block';
+                        showStatus('镜像完成！','ok',$('panelStatus'));
+                    }catch(e){showStatus('失败:'+e.message,'err',$('panelStatus'));}
+                };
+                $('rotBtn').onclick=async()=>{
+                    if(!curModelPath){showStatus('请先上传模型','err',$('panelStatusRot'));return;}
+                    const angle=parseFloat($('rotAngle').value);
+                    if(!(angle>0)){showStatus('请输入大于 0 的旋转角度','err',$('panelStatusRot'));return;}
+                    showStatus('旋转中...','info',$('panelStatusRot'));
+                    try{
+                        const resp=await fetch('/api/generate_rotate',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({filepath:curModelPath,axis:$('rotAxis').value,angle:angle,clockwise:$('rotDir').value==='cw',center_on_centroid:$('rotCenter').checked})});
+                        const d=await resp.json();if(d.error)throw new Error(d.error);
+                        const l=$('rotLink');l.href='/api/download_rotate?file='+encodeURIComponent(d.output_path);l.style.display='block';
+                        showStatus('旋转完成！','ok',$('panelStatusRot'));
+                    }catch(e){showStatus('失败:'+e.message,'err',$('panelStatusRot'));}
+                };
+            }
+            if(name==='corner'){
+                const st=$('panelStatus'),res=$('ccRes'),lnk=$('ccLink');
+                const payload=()=>JSON.stringify({filepath:curModelPath,extend_mm:parseFloat($('ccExtend').value)||6,gap_tol:parseFloat($('ccGapTol').value)||0.15,mode:$('ccMode').value});
+                $('ccCheck').onclick=async()=>{
+                    if(!curModelPath){showStatus('请先上传模型','err',st);return;}
+                    res.innerHTML='';lnk.style.display='none';
+                    showStatus('检测中...','info',st);
+                    try{
+                        const resp=await fetch('/api/corner_close',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({filepath:curModelPath,check_only:true,extend_mm:parseFloat($('ccExtend').value)||6,gap_tol:parseFloat($('ccGapTol').value)||0.15})});
+                        const d=await resp.json();if(d.error)throw new Error(d.error);
+                        const gapTxt=(d.gaps||[]).map(g=>'面['+g.faces.join(',')+'] 间隙 '+g.gap_mm.toFixed(2)+'mm 二面角 '+g.angle_deg+'° '+(g.closable?'✅可闭合':'⛔需加大延伸')).join('<br>')||'未检测到开放角落';
+                        res.innerHTML='检测到 '+d.total_corners+' 个角落（可闭合 '+d.closable_corners+' 个）<br>板厚 '+d.thickness+'mm<br>'+gapTxt;
+                        showStatus('检测完成','ok',st);
+                    }catch(e){showStatus('失败: '+e.message,'err',st);}
+                };
+                $('ccFix').onclick=async()=>{
+                    if(!curModelPath){showStatus('请先上传模型','err',st);return;}
+                    res.innerHTML='';lnk.style.display='none';
+                    const btn=$('ccFix');btn.disabled=true;btn.textContent='⏳ 修复中...';
+                    showStatus('修复中（角落闭合，请耐心等待）...','info',st);
+                    const ctl=new AbortController();const timer=setTimeout(()=>ctl.abort(),600*1000);
+                    try{
+                        const resp=await fetch('/api/corner_close',{method:'POST',headers:{'Content-Type':'application/json'},body:payload(),signal:ctl.signal});
+                        const d=await resp.json();if(d.error)throw new Error(d.error);
+                        if(d.output_path){lnk.href='/api/download_corner_close?file='+encodeURIComponent(d.output_path);lnk.style.display='block';}
+                        res.innerHTML='识别角落 '+d.detected_corners+'，成功修复 '+d.success_corners+'，失败 '+d.failed_corners+' 个<br>体积 '+d.original_volume.toFixed(1)+' → '+d.repaired_volume.toFixed(1)+' mm³（+'+d.added_volume.toFixed(1)+'）<br>板厚 '+d.thickness+'mm，形状有效';
+                        showStatus('角落闭合修复完成！','ok',st);
+                    }catch(e){
+                        if(e.name==='AbortError')showStatus('❌ 修复超时（超过10分钟）','err',st);
+                        else showStatus('失败: '+e.message,'err',st);
+                    }finally{clearTimeout(timer);btn.disabled=false;btn.textContent='🛠 执行角落闭合修复';}
+                };
+            }
+            if(name==='assembly'){
+                asmRoot=root;
+                root.querySelectorAll('[data-act="pick"]').forEach(b=>{
+                    b.onclick=()=>{const fi=root.querySelector('.asm-file[data-k="'+b.dataset.k+'"]');if(fi)fi.click();};
+                });
+                root.querySelectorAll('.asm-file').forEach(fi=>{
+                    fi.onchange=()=>{if(fi.files.length)loadAsmPartFromFile(fi.dataset.k,fi.files[0]);};
+                });
+                root.querySelectorAll('[data-act="auto"]').forEach(b=>{
+                    b.onclick=()=>autoAsmPart(b.dataset.k);
+                });
+                root.querySelectorAll('.asm-trans').forEach(cb=>{
+                    cb.onchange=()=>setAsmTrans(cb.dataset.k,cb.checked);
+                });
+                root.querySelectorAll('.asm-offset').forEach(sl=>{
+                    sl.oninput=()=>applyAsmOffset(sl.dataset.k,sl.value);
+                });
+                document.getElementById('asmAssemble').onclick=arrangeAsm;
+                document.getElementById('asmDrag').onclick=()=>setAsmDrag(!asmDragMode);
+                document.getElementById('asmClear').onclick=clearAsm;
+                // 输出装配吻合结构体 STEP（再修理后的上模 + 产品 + 再修理后的下模）
+                document.getElementById('asmBuild').onclick=async()=>{
+                    const stEl=document.getElementById('asmBuildStatus'),lk=document.getElementById('asmBuildLink');
+                    const set=m=>{if(stEl)stEl.textContent=m;};
+                    const pick=(name)=>((window._refixFiles&&window._refixFiles[name])
+                                 ||(window._fixedFiles&&window._fixedFiles[name])
+                                 ||(window._moldFiles&&window._moldFiles[name])||null);
+                    // 再修理后的上模/下模优先；无再修理则退回第一次修复/生成模具（仍可装配）
+                    const punch=pick('punch'),cavity=pick('cavity');
+                    // 原始 fix_output 模具（含同框架产品实体）：优先第一次修复，其次生成模具
+                    const prodSrc=((window._fixedFiles&&window._fixedFiles.punch)
+                              ||(window._moldFiles&&window._moldFiles.punch)||null);
+                    if(!punch||!cavity){set('请先执行「模具再修理」或上传并生成/修复上下模。');return;}
+                    if(!prodSrc){set('未找到原始模具（含产品实体）。请先执行「模具修复」。');return;}
+                    const btn=document.getElementById('asmBuild');btn.disabled=true;btn.textContent='⏳ 生成合拢装配体...';set('正在生成（可能耗时数十秒）...');
+                    try{
+                        const resp=await fetch('/api/build_assembly',{method:'POST',headers:{'Content-Type':'application/json'},
+                            body:JSON.stringify({punch:punch,cavity:cavity,product_src:prodSrc,fuse:false})});
+                        const d=await resp.json();
+                        if(d.error)throw new Error(d.error);
+                        if(d.assembly){lk.href='/api/download_assembly?file='+encodeURIComponent(d.assembly);lk.style.display='block';}
+                        set('✅ 合拢装配体已生成：'+d.assembly_solid_count+' 结构体，三对干涉=0'+(d.max_gap!=null?'，最大间隙 '+d.max_gap+'mm':'')+'（点下方按钮下载）');
+                    }catch(e){set('❌ 生成失败:'+e.message);}
+                    finally{btn.disabled=false;btn.textContent='📦 输出装配体(STEP)';}
+                };
+                setAsmDrag(false);
+            }
+            if(name==='refix'){
+                const st=$('panelStatus'),res=$('rxRes'),
+                      l1=$('rxPunchLink'),l2=$('rxCavityLink');
+                const up=async f=>{
+                    const fd=new FormData();fd.append('file',f);
+                    const resp=await fetch('/upload',{method:'POST',body:fd});
+                    const d=await resp.json();if(d.error)throw new Error(d.error);
+                    return d.filepath;
+                };
+                $('rxBtn').onclick=async()=>{
+                    const pf=$('rxPunch').files[0],cf=$('rxCavity').files[0];
+                    if(!pf||!cf){showStatus('请先选择【上模】与【下模】两个 STEP 文件','err',st);return;}
+                    const btn=$('rxBtn');btn.disabled=true;btn.textContent='⏳ 上传中...';
+                    res.innerHTML='';l1.style.display='none';l2.style.display='none';
+                    const ctl=new AbortController();const timer=setTimeout(()=>ctl.abort(),900*1000);
+                    try{
+                        showStatus('上传上模/下模...','info',st);
+                        const [pp,cav]=await Promise.all([up(pf),up(cf)]);
+                        btn.textContent='⏳ 再修理中（可能几分钟）...';
+                        showStatus('再修理中（去除产品结构体）...','info',st);
+                        const resp=await fetch('/api/mold_refix',{method:'POST',
+                            headers:{'Content-Type':'application/json'},
+                            body:JSON.stringify({punch_filepath:pp,cavity_filepath:cav,
+                                corner_fill:false}),
+                            signal:ctl.signal});
+                        const d=await resp.json();if(d.error)throw new Error(d.error);
+                        if(d.punch_output){l1.href='/api/download_refix?file='+encodeURIComponent(d.punch_output);l1.style.display='block';}
+                        if(d.cavity_output){l2.href='/api/download_refix?file='+encodeURIComponent(d.cavity_output);l2.style.display='block';}
+                        // 记录再修理结果，供「装配·拼合」自动填入(上模/下模)
+                        window._refixFiles=window._refixFiles||{};
+                        window._refixFiles.punch=d.punch_output||window._refixFiles.punch;
+                        window._refixFiles.cavity=d.cavity_output||window._refixFiles.cavity;
+                        res.innerHTML='✅ 再修理完成：已剔除上/下模内的产品结构体。<br>可到「🧩 装配」用【自动】填入再修理后的上模/下模。';
+                        showStatus('再修理完成！','ok',st);
+                    }catch(e){
+                        if(e.name==='AbortError')showStatus('❌ 再修理超时（超过15分钟）','err',st);
+                        else showStatus('失败: '+e.message,'err',st);
+                    }finally{clearTimeout(timer);btn.disabled=false;btn.textContent='🛠 执行再修理';}
+                };
+            }
+            if(name==='contact'){
+                const st=$('panelStatus'), res=$('cfRes'),
+                      lP=$('cfPunchLink'), lC=$('cfCavityLink'), lR=$('cfReportLink');
+                const up=async f=>{
+                    const fd=new FormData();fd.append('file',f);
+                    const resp=await fetch('/upload',{method:'POST',body:fd});
+                    const d=await resp.json();if(d.error)throw new Error(d.error);
+                    return d.filepath;
+                };
+                const hidLinks=()=>{lP.style.display='none';lC.style.display='none';lR.style.display='none';};
+                $('cfBtn').onclick=async()=>{
+                    const pf=$('cfProduct').files[0];
+                    if(!pf){showStatus('请选择【产品】STEP 文件','err',st);return;}
+                    const exportStep=$('cfExport').checked;
+                    const btn=$('cfBtn');btn.disabled=true;btn.textContent='⏳ 上传中...';
+                    hidLinks();res.innerHTML='';
+                    const ctl=new AbortController();const timer=setTimeout(()=>ctl.abort(),900*1000);
+                    try{
+                        showStatus('上传文件...','info',st);
+                        const pfp=await up(pf);
+                        btn.textContent='⏳ 提取形变配合面（可能几分钟）...';
+                        showStatus('提取形变配合面中...','info',st);
+                        const resp=await fetch('/api/extract_contact_faces',{method:'POST',
+                            headers:{'Content-Type':'application/json'},
+                            body:JSON.stringify({product_filepath:pfp,
+                                export_step:exportStep}),
+                            signal:ctl.signal});
+                        const d=await resp.json();if(d.error)throw new Error(d.error);
+                        let html='✅ 提取完成：<br>';
+                        (d.summary||[]).forEach(s=>{
+                            const kn=s.kind==='punch'?'凸模':'凹模';
+                            html+=`　· ${kn}：配合面 ${s.contact_face_count} 片，总贴合面积 ${Number(s.total_contact_area_mm2).toFixed(4)} mm²<br>`;
+                        });
+                        (d.entries||[]).forEach(e=>{
+                            if(e.step){
+                                const link=e.kind==='punch'?lP:lC;
+                                link.href='/api/download_contact_faces?file='+encodeURIComponent(e.step);
+                                link.style.display='block';
+                            }
+                        });
+                        if(d.report){lR.href='/api/download_contact_faces?file='+encodeURIComponent(d.report);lR.style.display='block';}
+                        res.innerHTML=html+'<br>点下方按钮下载 STEP / JSON 报告。';
+                        showStatus('提取完成！','ok',st);
+                    }catch(e){
+                        if(e.name==='AbortError')showStatus('❌ 提取超时（超过15分钟）','err',st);
+                        else showStatus('失败: '+e.message,'err',st);
+                    }finally{clearTimeout(timer);btn.disabled=false;btn.textContent='📐 提取形变配合面';}
+                };
+            }
+            if(name==='m2'){
+                const st=$('panelStatus'), res=$('m2Res'),
+                      lP=$('m2PunchLink'), lC=$('m2CavityLink');
+                const up=async f=>{
+                    const fd=new FormData();fd.append('file',f);
+                    const resp=await fetch('/upload',{method:'POST',body:fd});
+                    const d=await resp.json();if(d.error)throw new Error(d.error);
+                    return d.filepath;
+                };
+                const hidLinks=()=>{lP.style.display='none';lC.style.display='none';};
+                $('m2Btn').onclick=async()=>{
+                    const pf=$('m2Product').files[0], uf=$('m2Upper').files[0], lf=$('m2Lower').files[0];
+                    if(!pf&&!uf&&!lf){showStatus('请选择【产品】STEP（推荐·法二B），或【上形变面】/【下形变面】','err',st);return;}
+                    const num=id=>{const v=$(id).value;return (v===''||v==null)?null:parseFloat(v);};
+                    const exportStep=$('m2Export').checked;
+                    const btn=$('m2Btn');btn.disabled=true;btn.textContent='⏳ 上传中...';
+                    hidLinks();res.innerHTML='';
+                    const ctl=new AbortController();const timer=setTimeout(()=>ctl.abort(),900*1000);
+                    try{
+                        showStatus('上传文件...','info',st);
+                        const pfp=pf?await up(pf):null, ufp=uf?await up(uf):null, lfp=lf?await up(lf):null;
+                        btn.textContent='⏳ 生成模具（法二，可能几分钟）...';
+                        showStatus('生成模具（法二）中...','info',st);
+                        const resp=await fetch('/api/generate_mold_method2',{method:'POST',
+                            headers:{'Content-Type':'application/json'},
+                            body:JSON.stringify({product_filepath:pfp,upper_filepath:ufp,lower_filepath:lfp,
+                                h1:num('m2H1'),h_cavity:num('m2Hc'),
+                                base_lx:num('m2Lx'),base_ly:num('m2Ly'),base_hz:num('m2Hz'),
+                                margin:parseFloat($('m2Mg').value||'5'),export_step:exportStep}),
+                            signal:ctl.signal});
+                        const d=await resp.json();if(d.error)throw new Error(d.error);
+                        let html='✅ 生成完成：<br>';
+                        (d.summary||[]).forEach(s=>{
+                            const kn=s.kind==='punch'?'上模':'下模';
+                            let tip='';
+                            if(s.kind==='punch'&&s.details){
+                                tip = (s.details.src==='protrusion')
+                                    ? '<span style="color:#2e7d32">（✅ 贴合产品上表面随形凸起，1实体1壳）</span>'
+                                    : '<span style="color:#c62828">（⚠️ 贴合凸起构造失败，已回退为稳定实体块）</span>';
+                            }
+                            html+=`　· ${kn}：体积 ${Number(s.volume).toFixed(2)} mm³ ${tip}<br>`;
+                        });
+                        (d.entries||[]).forEach(e=>{
+                            if(e.step){
+                                const link=e.kind==='punch'?lP:lC;
+                                link.href='/api/download_mold_method2?file='+encodeURIComponent(e.step);
+                                link.style.display='block';
+                            }
+                        });
+                        res.innerHTML=html+'<br>点下方按钮下载 STEP。';
+                        showStatus('生成完成！','ok',st);
+                    }catch(e){
+                        if(e.name==='AbortError')showStatus('❌ 生成超时（超过15分钟）','err',st);
+                        else showStatus('失败: '+e.message,'err',st);
+                    }finally{clearTimeout(timer);btn.disabled=false;btn.textContent='🛠 生成上/下模（法二）';}
+                };
+
+                /* ================= 多方法自动生成（接 moldkit 方法注册表） ================= */
+                const mkSt=$('panelStatus'), mkSum=$('mkSummary'), mkArts=$('mkArts'), mkLog=$('mkLog');
+                let MK=[], mkChosen=new Set(), mkTimer=null, mkJob=null;
+                const mkEsc=s=>String(s==null?'':s).replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
+                const mkForm=methods=>{
+                    const fd=new FormData();
+                    methods.forEach(m=>fd.append('methods',m));
+                    fd.append('part_name',$('mkName').value||'');
+                    const put=(k,id)=>{const f=$(id).files[0];if(f)fd.append(k,f);};
+                    put('product','mkProduct');put('upper','mkUpper');put('lower','mkLower');
+                    document.querySelectorAll('#mkParams input[data-pk]').forEach(e=>fd.append('p.'+e.dataset.pk,e.value));
+                    document.querySelectorAll('#mkExtra input[type=file]').forEach(e=>{
+                        if(e.files&&e.files[0])fd.append(e.dataset.xk,e.files[0]);
+                    });
+                    return fd;
+                };
+                const mkRenderParams=()=>{
+                    let html='';
+                    mkChosen.forEach(n=>{
+                        const m=MK.find(x=>x.name===n);
+                        if(!m||!(m.params||[]).length)return;
+                        const xtra=(m.extra_inputs||[]).map(x=>x.key);
+                        html+='<div style="border-left:2px solid var(--border);padding-left:10px;margin:8px 0"><b>'+mkEsc(m.label)+'</b>';
+                        m.params.forEach(p=>{
+                            if(xtra.indexOf(p.name)>=0)return;
+                            html+='<label class="f" style="margin:4px 0 0">'+mkEsc(p.label)+(p.unit?' ('+p.unit+')':'')+'</label>'
+                                 +'<input type="text" data-pk="'+p.name+'" value="'+mkEsc(p.default)+'" style="width:100%">';
+                        });
+                        html+='</div>';
+                    });
+                    $('mkParams').innerHTML=html;
+                };
+                const mkRender=s=>{
+                    let h='<table style="width:100%;border-collapse:collapse;font-size:12px">'
+                        +'<tr style="color:#888"><th align="left">方法</th><th align="left">结果</th>'
+                        +'<th align="left">上模 mm³</th><th align="left">下模 mm³</th>'
+                        +'<th align="left">干涉</th><th align="left">贴合度</th></tr>';
+                    Object.keys(s.results||{}).forEach(n=>{
+                        const o=s.results[n], rep=((o.metrics||{}).report)||{};
+                        const pu=rep.punch, ca=rep.cavity, pr=rep.pair||{};
+                        const co=(rep.punch_conformity&&rep.punch_conformity.ratio!=null)
+                            ?(rep.punch_conformity.ratio*100).toFixed(1)+'%':'—';
+                        h+='<tr><td>'+mkEsc(n)+'</td>'
+                          +'<td style="color:'+(o.ok?'#2e7d32':'#c62828')+'">'+(o.ok?'成功':'失败')+'</td>'
+                          +'<td>'+(pu?Math.round(pu.volume_mm3).toLocaleString():'—')+'</td>'
+                          +'<td>'+(ca?Math.round(ca.volume_mm3).toLocaleString():'—')+'</td>'
+                          +'<td>'+(pr.interference_mm3!=null?Number(pr.interference_mm3).toFixed(3):'—')+'</td>'
+                          +'<td>'+co+'</td></tr>';
+                        if(!o.ok)h+='<tr><td colspan="6" style="color:#c62828">'+mkEsc(o.error||'')+'</td></tr>';
+                    });
+                    mkSum.innerHTML=h+'</table>';
+                    mkArts.innerHTML=(s.artifacts||[]).filter(f=>/\.stp$/i.test(f.name)).map(f=>
+                        '<a href="/api/moldkit/file/'+s.id+'/'+encodeURIComponent(f.name)+'?download=1" '
+                        +'style="display:inline-block;margin:3px 4px 0 0;padding:3px 8px;border:1px solid var(--border);'
+                        +'border-radius:5px;text-decoration:none;color:inherit">'+mkEsc(f.name)
+                        +' ('+Math.round(f.size/1024)+'KB)</a>').join('');
+                };
+                const mkPoll=async()=>{
+                    try{
+                        const s=await (await fetch('/api/moldkit/job/'+mkJob)).json();
+                        mkLog.textContent=(s.log||[]).join('\n');mkLog.scrollTop=1e9;
+                        showStatus((s.status==='running'?'运行中…':s.status==='done'?'✅ 完成':'❌ 失败')+'  '+s.elapsed+'s',
+                                   s.status==='running'?'info':(s.status==='done'?'ok':'err'),mkSt);
+                        if(s.status!=='running'){
+                            clearInterval(mkTimer);mkTimer=null;mkRender(s);
+                            $('mkRun').disabled=false;$('mkAll').disabled=false;
+                        }
+                    }catch(e){}
+                };
+                const mkStart=async methods=>{
+                    if(!methods.length){showStatus('请先勾选方法','err',mkSt);return;}
+                    mkSum.innerHTML='';mkArts.innerHTML='';
+                    $('mkRun').disabled=true;$('mkAll').disabled=true;
+                    showStatus('提交任务…','info',mkSt);mkLog.textContent='提交任务…';
+                    try{
+                        const d=await (await fetch('/api/moldkit/run',{method:'POST',body:mkForm(methods)})).json();
+                        if(d.error)throw new Error(d.error);
+                        mkJob=d.job;
+                        if(mkTimer)clearInterval(mkTimer);
+                        mkTimer=setInterval(mkPoll,900);
+                    }catch(e){
+                        showStatus('失败: '+e.message,'err',mkSt);
+                        $('mkRun').disabled=false;$('mkAll').disabled=false;
+                    }
+                };
+                const mkLoad=async()=>{
+                    try{
+                        const d=await (await fetch('/api/moldkit/methods')).json();
+                        if(d.error){$('mkMethods').innerHTML='<span style="color:#c62828">'+mkEsc(d.error)+'</span>';return;}
+                        MK=d.methods||[];
+                        $('mkMethods').innerHTML=MK.map(m=>
+                            '<label style="display:block;cursor:'+(m.available?'pointer':'not-allowed')+';'
+                            +(m.available?'':'opacity:.45')+'">'
+                            +'<input type="checkbox" data-mk="'+m.name+'"'+(m.available?'':' disabled')+'> '
+                            +'<b>'+mkEsc(m.label)+'</b> <span style="color:#888">['+mkEsc(m.engine)+']</span>'
+                            +(m.desc?'<br><span style="color:#888;margin-left:20px">'+mkEsc(m.desc)+'</span>':'')
+                            +(m.cons?'<br><span style="color:#c77;margin-left:20px">限制：'+mkEsc(m.cons)+'</span>':'')
+                            +(m.available?'':'<br><span style="color:#c62828;margin-left:20px">不可用：'
+                                          +mkEsc(m.unavailable_reason||'')+'</span>')
+                            +'</label>').join('');
+                        $('mkMethods').querySelectorAll('input[data-mk]').forEach(cb=>{
+                            cb.onchange=()=>{
+                                cb.checked?mkChosen.add(cb.dataset.mk):mkChosen.delete(cb.dataset.mk);
+                                mkRenderParams();
+                            };
+                        });
+                        const extra=[];
+                        MK.forEach(m=>(m.extra_inputs||[]).forEach(x=>{
+                            if(!extra.some(y=>y.key===x.key))extra.push(x);
+                        }));
+                        $('mkExtra').innerHTML=extra.map(x=>
+                            '<label class="f">'+mkEsc(x.label)+'</label>'
+                            +'<input type="file" data-xk="'+x.key+'" accept="'+(x.accept||'.stp,.step')
+                            +'" style="width:100%">').join('');
+                    }catch(e){
+                        $('mkMethods').innerHTML='<span style="color:#c62828">加载失败: '+mkEsc(e.message)+'</span>';
+                    }
+                };
+                mkLoad();
+                $('mkRun').onclick=()=>mkStart(Array.from(mkChosen));
+                $('mkAll').onclick=()=>mkStart(MK.filter(m=>m.available).map(m=>m.name));
+                /* ================= 多方法逻辑结束 ================= */
+            }
+            if(name==='holefill'){
+                const st=$('panelStatus'),res=$('hfRes'),lnk=$('hfLink');
+                $('hfBtn').onclick=async()=>{
+                    if(!curModelPath){showStatus('请先上传模型','err',st);return;}
+                    showStatus('识别并补齐孔洞中...','info',st);res.innerHTML='';
+                    try{
+                        const resp=await fetch('/api/generate_hole_fill',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({filepath:curModelPath})});
+                        const d=await resp.json();if(d.error)throw new Error(d.error);
+                        if(d.hole_count===0){
+                            res.innerHTML='✅ 未检测到圆形孔洞（模型可能只有折弯圆角，无穿孔）。';
+                            showStatus('完成：未发现孔洞','ok',st);return;
+                        }
+                        lnk.href='/api/download_hole_fill?file='+encodeURIComponent(d.output_path);
+                        lnk.style.display='block';
+                        const dia=[...new Set(d.holes.map(h=>'Φ'+h.diameter))].join(' / ');
+                        res.innerHTML='✅ 识别 '+d.hole_count+' 个孔洞，成功补齐 '+d.filled_count+' 个'+(d.skipped_count?('，跳过 '+d.skipped_count+' 个'):'')+'。<br>'
+                                    +'　· 孔：'+dia+'<br>'
+                                    +'　· 体积：'+Number(d.volume_before).toFixed(0)+' → '+Number(d.volume_after).toFixed(0)+' mm³<br>'
+                                    +'　· BRepCheck 有效：'+(d.valid?'✅':'⚠️')+'<br>下方可下载补齐后模型。';
+                        showStatus('孔洞补齐完成！','ok',st);
+                    }catch(e){showStatus('失败:'+e.message,'err',st);}
+                };
+            }
+        }
+
+        async function doUpload(file, statusEl){
+            const ext=file.name.split('.').pop().toLowerCase();
+            if(!['stp','step','stl'].includes(ext)){showStatus('仅支持 STP/STEP/STL','err',statusEl);return;}
+            loadSpin(true);showStatus('上传中...','info',statusEl);
+            const ctl=new AbortController();
+            const timer=setTimeout(()=>ctl.abort(),150*1000);
+            try{
+                const fd=new FormData();fd.append('file',file);
+                const resp=await fetch('/upload',{method:'POST',body:fd,signal:ctl.signal});
+                clearTimeout(timer);
+                const data=await resp.json();if(data.error)throw new Error(data.error);
+                renderModel(data);
+                showStatus('已加载 '+(data.face_count||0)+' 个面','ok',statusEl);
+            }catch(e){
+                clearTimeout(timer);
+                if(e.name==='AbortError')showStatus('❌ 上传超时（服务器解析太久已放弃）。建议：在 CAD 中精简模型，或导出为 STL 再上传','err',statusEl);
+                else showStatus('❌ '+e.message,'err',statusEl);
+            }
+            finally{loadSpin(false);}
+        }
+
+        /* ================= 动画 ================= */
+        function animate(){requestAnimationFrame(animate);controls.update();composer.render();}
+        animate();
+        function demoBox(){
+            const geo=new THREE.BoxGeometry(100,50,30);
+            const mesh=new THREE.Mesh(geo,getMat(modelColor));mesh.userData.isModel=true;modelGroup.add(mesh);clickableMeshes.push(mesh);
+            const eg=new THREE.EdgesGeometry(geo);edgeGroup.add(makeEdgeLine2(eg.getAttribute('position').array,0x2a2e35));
+            curInfo={name:'演示长方体',size:[100,50,30]};fit(100);updateGround();
+        }
+        demoBox();
+        console.log('3D Viewer v3');
+    </script>
+</body>
+</html>

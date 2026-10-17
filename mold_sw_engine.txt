@@ -1,0 +1,1338 @@
+'=====================================================================================
+' mold_sw_engine —— SolidWorks 通用「模具操作解释器」（VBA）
+'=====================================================================================
+' 【为什么要做成解释器】
+'   之前每换一种做法就要改一次 VBA、重开一次 VBE、重贴一次代码，非常慢。
+'   现在 Python 侧只生成一个【操作脚本】(job)，这个宏逐行执行。
+'   新增一种模具生成方法 = 只写 Python，不用碰 VBA。
+'
+' 【作业文件】%TEMP%\moldsv_job.txt   （ANSI/GBK，一行一个操作，用 | 分隔键值）
+'   OP=IMPORT|SRC=C:\a.stp|NAME=srf
+'   OP=PLANE_Z|Z=72|NAME=p1
+'   OP=SKETCH_POLY|PLANE=p1|FILE=C:\poly.txt|NAME=sk1
+'   OP=BOSS_UPTO|SKETCH=sk1|TARGET=srf|PLANE=p1|DIR=DOWN|NAME=f1
+'   OP=CHECK
+'   OP=EXPORT|OUT=C:\out.stp
+' 【结果】%TEMP%\moldsv_result.txt     【日志】%TEMP%\moldsv_log.txt
+' 【入口】RunMoldSV（零参，供 RunMacro2 调用）
+'
+' 【支持的操作】
+'   NEW                                        新建零件（用模板）
+'   IMPORT   SRC NAME                          导入 STEP，并给这个文档起别名
+'   PLANE_Z  Z NAME                            建平行前视基准面、位于 z=Z(mm) 的基准面
+'   SKETCH_POLY PLANE FILE NAME                在基准面上画点表多边形（文件首行=点数）
+'   SKETCH_RECT PLANE X1 Y1 X2 Y2 NAME         在基准面上画矩形（毫米）
+'   BOSS_BLIND SKETCH UP DN NAME               双向盲拉伸（UP 向 +Z、DN 向 -Z，毫米）
+'   BOSS_UPTO  SKETCH TARGET PLANE DIR NAME     成形到曲面·凸台（DIR=UP/DOWN）
+'   CUT_UPTO   SKETCH TARGET PLANE DIR NAME     成形到曲面·切除（DIR=UP/DOWN）
+'   COMBINE  OP=CUT|ADD|COMMON MAIN TOOL NAME  组合（MAIN/TOOL = 实体序号或 ALL）
+'   DELETE_SURFACES                            尝试删除所有曲面体（被特征引用时删不掉，会记录）
+'   KEEP_BODIES IDX                            只保留第 IDX 个实体
+'   CHECK                                      汇报实体/曲面数、体积、包围盒
+'   EXPORT   OUT                               导出 STEP
+'   LOG      MSG                               写一行日志
+'   SET      NAME VALUE                        记录变量
+'
+' 【踩过的坑（都已在本文件里规避）】
+'   · 终止条件参考实体必须用 select mark = 1（官方帮助原文）
+'   · Dir=True 才是翻转拉伸方向；Flip 是"翻转切除侧"
+'   · 对曲面体调 SketchUseEdge3 返回 True 却生成 0 个实体 —— 轮廓一律外部算好喂进来
+'   · 轮廓点表首尾重合会画出零长度线段 → 草图失效 → 拉伸返回 Nothing
+'   · FACE 参考 + mark 2 会把 SW 直接打崩，绝不使用
+'   · CreateCornerRectangle 返回草图实体数组，只能语句形式调用
+'   · 所有 Dim 放过程最前面；不要粘贴 Attribute VB_Name 行
+'=====================================================================================
+Option Explicit
+
+Private Const JOB_NAME As String = "moldsv_job.txt"
+Private Const RES_NAME As String = "moldsv_result.txt"
+Private Const LOG_NAME As String = "moldsv_log.txt"
+
+' ---- swEndConditions_e ----
+Private Const EC_BLIND As Long = 0
+Private Const EC_UPTOSURFACE As Long = 4
+Private Const EC_UPTOSELECTION As Long = 10
+' ---- swStartConditions_e ----
+Private Const ST_SKETCHPLANE As Long = 0
+' ---- 选择标记 ----
+Private Const MK_SKETCH As Long = 0
+Private Const MK_ENDREF As Long = 1
+' ---- swBodyOperationType_e ----
+' ★直接引用官方枚举名★：数值不敢猜（swconst 没能完整 makepy，之前硬编码的
+'   15901/15902/15903 无法核实）。SW 宏工程默认引用 swconst，编译期即可确定。
+Private Const BOP_INTERSECT As Long = swBodyOperationType_e.SWBODYINTERSECT
+Private Const BOP_CUT As Long = swBodyOperationType_e.SWBODYCUT
+Private Const BOP_ADD As Long = swBodyOperationType_e.SWBODYADD
+' ---- 体类型 ----
+Private Const BT_SOLID As Long = 0
+Private Const BT_SURFACE As Long = 1
+
+' ---- 运行时状态 ----
+Private gDoc As Object
+Private gPlanes As Object
+Private gSketches As Object
+Private gFeats As Object
+Private gVars As Object
+Private gDocs As Object
+Private gLogN As Long
+
+
+'=====================================================================================
+' 日志 / 结果
+'=====================================================================================
+Private Sub L(s As String)
+    Dim f As Integer
+    gLogN = gLogN + 1
+    On Error Resume Next
+    f = FreeFile
+    Open Environ$("TEMP") & "\" & LOG_NAME For Append As #f
+    Print #f, Format$(gLogN, "000") & "  " & s
+    Close #f
+    On Error GoTo 0
+End Sub
+
+Private Sub WriteRes(s As String)
+    Dim f As Integer
+    f = FreeFile
+    Open Environ$("TEMP") & "\" & RES_NAME For Output As #f
+    Print #f, s
+    Close #f
+End Sub
+
+
+' 把用到的枚举真值写进日志（省得以后再猜数字）
+Private Sub DumpEnums()
+    On Error Resume Next
+    Call L("枚举: swBodyOperationType_e ADD=" & CStr(swBodyOperationType_e.SWBODYADD) & _
+           " CUT=" & CStr(swBodyOperationType_e.SWBODYCUT) & _
+           " INTERSECT=" & CStr(swBodyOperationType_e.SWBODYINTERSECT))
+    Call L("枚举: swEndConditions_e blind=" & CStr(swEndConditions_e.swEndCondBlind) & _
+           " uptoSurface=" & CStr(swEndConditions_e.swEndCondUpToSurface) & _
+           " uptoSelection=" & CStr(swEndConditions_e.swEndCondUpToSelection))
+    Call L("枚举: swStartConditions_e sketchPlane=" & CStr(swStartConditions_e.swStartSketchPlane))
+    On Error GoTo 0
+End Sub
+
+
+'=====================================================================================
+' ★入口：执行整个作业文件
+'=====================================================================================
+Public Sub RunMoldSV()
+    Dim swApp As Object
+    Dim f As Integer
+    Dim ln As String
+    Dim nOp As Long, nOk As Long
+    Dim op As String
+    Dim errMsg As String
+
+    On Error GoTo Fail
+
+    f = FreeFile
+    Open Environ$("TEMP") & "\" & LOG_NAME For Output As #f
+    Close #f
+    gLogN = 0
+    Call L("=== mold_sw_engine 开始 ===")
+    Call L("作业文件 = " & JobPath())
+
+    Set gPlanes = CreateObject("Scripting.Dictionary")
+    Set gSketches = CreateObject("Scripting.Dictionary")
+    Set gFeats = CreateObject("Scripting.Dictionary")
+    Set gVars = CreateObject("Scripting.Dictionary")
+    Set gDocs = CreateObject("Scripting.Dictionary")
+    Set gDoc = Nothing
+
+    Set swApp = Application.SldWorks
+    If swApp Is Nothing Then
+        Call L("!! Application.SldWorks 为空")
+        WriteRes "ERR|0|swApp 为空"
+        Exit Sub
+    End If
+    Call L("SW revision=" & CStr(swApp.RevisionNumber))
+    Call DumpEnums
+
+    If Dir(JobPath()) = "" Then
+        Call L("!! 找不到作业文件")
+        WriteRes "ERR|0|找不到作业文件"
+        Exit Sub
+    End If
+
+    f = FreeFile
+    Open JobPath() For Input As #f
+    Do While Not EOF(f)
+        Line Input #f, ln
+        ln = Trim$(ln)
+        If Len(ln) > 0 And Left$(ln, 1) <> "#" Then
+            op = OpName(ln)
+            If Len(op) > 0 Then
+                nOp = nOp + 1
+                Call L("---- OP" & CStr(nOp) & " " & op)
+                errMsg = ExecOp(swApp, op, ln)
+                If Len(errMsg) > 0 Then
+                    Call L("  !! " & errMsg)
+                    Close #f
+                    Call L("=== 在 OP" & CStr(nOp) & " 处失败 ===")
+                    WriteRes "ERR|" & CStr(nOp) & "|" & errMsg
+                    Exit Sub
+                End If
+                nOk = nOk + 1
+            End If
+        End If
+    Loop
+    Close #f
+
+    Call L("=== 完成：共 " & CStr(nOp) & " 个操作，成功 " & CStr(nOk) & " 个 ===")
+    WriteRes "OK|" & CStr(nOk)
+    Exit Sub
+Fail:
+    Call L("!! 运行时错误 " & CStr(Err.Number) & " : " & Err.Description)
+    WriteRes "ERR|" & CStr(Err.Number) & "|" & Err.Description
+End Sub
+
+
+'=====================================================================================
+' 操作分派
+'=====================================================================================
+Private Function ExecOp(swApp As Object, op As String, ln As String) As String
+    Dim a As Variant
+    Dim swModel As Object
+    Dim nm As String
+
+    a = Split(ln, "|")
+    ExecOp = ""
+
+    Select Case op
+    Case "NEW"
+        Set gDoc = swApp.NewDocument(TemplatePath(), 0, 0, 0)
+        If gDoc Is Nothing Then
+            ExecOp = "新建零件失败（模板路径不对？）"
+        Else
+            Call L("  新建零件 " & gDoc.GetTitle)
+        End If
+
+    Case "IMPORT"
+        Set swModel = EnsureDoc(swApp, KV(a, "SRC"), KV(a, "NAME"))
+        If swModel Is Nothing Then
+            ExecOp = "导入失败: " & KV(a, "SRC")
+        Else
+            Set gDoc = swModel
+        End If
+
+    Case "USE"
+        Set swModel = GetDoc(KV(a, "NAME"))
+        If swModel Is Nothing Then
+            ExecOp = "找不到文档 " & KV(a, "NAME")
+        Else
+            Set gDoc = swModel
+        End If
+
+    Case "PLANE_Z"
+        nm = MakePlaneAtZ(gDoc, Val(KV(a, "Z")) / 1000#, KV(a, "NAME"))
+        If Len(nm) = 0 Then ExecOp = "建基准面失败 (Z=" & KV(a, "Z") & ")"
+
+    Case "PLANE_AUTO"
+        ' 按法向自动找系统基准面（★本机 gb 模板里"前视基准面"才是 Z 法向★，
+        ' 写死中文名在别的模板上会错）
+        nm = FindZPlane(gDoc)
+        If Len(nm) = 0 Then
+            ExecOp = "找不到 Z 法向基准面"
+        Else
+            If Len(KV(a, "NAME")) > 0 Then gPlanes(KV(a, "NAME")) = nm
+            Call L("    Z 法向基准面 = " & nm)
+        End If
+
+    Case "SKETCH_POLY"
+        nm = SketchPoly(gDoc, PlaneName(KV(a, "PLANE")), KV(a, "FILE"), KV(a, "NAME"))
+        If Len(nm) = 0 Then ExecOp = "多边形草图失败"
+
+    Case "SKETCH_RECT"
+        nm = SketchRect(gDoc, PlaneName(KV(a, "PLANE")), Val(KV(a, "X1")), Val(KV(a, "Y1")), _
+                        Val(KV(a, "X2")), Val(KV(a, "Y2")), KV(a, "NAME"))
+        If Len(nm) = 0 Then ExecOp = "矩形草图失败"
+
+    Case "BOSS_BLIND"
+        nm = BossBlind(gDoc, SketchName(KV(a, "SKETCH")), Val(KV(a, "UP")) / 1000#, _
+                       Val(KV(a, "DN")) / 1000#, KV(a, "NAME"), _
+                       (KV(a, "MERGE") <> "0"))
+        If Len(nm) = 0 Then ExecOp = "盲拉伸失败"
+
+    Case "BOSS_UPTO"
+        nm = UptoSurface(gDoc, SketchName(KV(a, "SKETCH")), KV(a, "TARGET"), _
+                         PlaneName(KV(a, "PLANE")), KV(a, "DIR"), False, KV(a, "NAME"))
+        If Len(nm) = 0 Then ExecOp = "成形到曲面(凸台)失败"
+
+    Case "CUT_UPTO"
+        nm = UptoSurface(gDoc, SketchName(KV(a, "SKETCH")), KV(a, "TARGET"), _
+                         PlaneName(KV(a, "PLANE")), KV(a, "DIR"), True, KV(a, "NAME"))
+        If Len(nm) = 0 Then ExecOp = "成形到曲面(切除)失败"
+
+    Case "CUT_SURFACE"
+        ' 使用曲面切除（不依赖"高度场"）
+        '   ★「成形到曲面」要求竖直线上只打中曲面一次 —— 带内凹加强筋的穹顶做不到，
+        '     会直接返回 Nothing。这时改用"投影轮廓棱柱 + 用曲面把它切开"：
+        '     棱柱的侧壁正好穿过曲面的边界环 → 曲面能把棱柱【切断】→ 切除有效。
+        If Not CutBySurface(gDoc, KV(a, "SURF"), KV(a, "TARGET"), KV(a, "KEEP"), _
+                            KV(a, "NAME")) Then
+            ExecOp = "使用曲面切除失败"
+        End If
+
+    Case "COMBINE"
+        ' ★组合类型用 TYPE 键★（作业行以 OP=COMBINE 开头，用 OP 会取到 "COMBINE"）
+        If Not Combine(gDoc, KV(a, "TYPE"), KV(a, "MAIN"), KV(a, "TOOL"), KV(a, "NAME")) Then
+            ExecOp = "组合失败"
+        End If
+
+    Case "DELETE_SURFACES"
+        Call DeleteSurfaces(gDoc)
+
+    Case "KEEP_BODIES"
+        If Not KeepBodies(gDoc, Val(KV(a, "IDX"))) Then ExecOp = "保留实体失败"
+
+    Case "DRAFT_ANALYSIS"
+        Call DraftAnalysis(gDoc, KV(a, "DIR"), Val(KV(a, "ANGLE")))
+
+    Case "MOLD_PARTING_LINE"
+        If Not MoldPartingLine(gDoc, (KV(a, "FLIP") = "1"), KV(a, "NAME")) Then
+            ExecOp = "分型线失败"
+        End If
+
+    Case "MOLD_PARTING_SURFACE"
+        If Not MoldPartingSurface(gDoc, KV(a, "NAME")) Then
+            ExecOp = "分型面失败"
+        End If
+
+    Case "MOLD_SHUTOFF"
+        If Not MoldShutOff(gDoc, KV(a, "NAME")) Then
+            ExecOp = "关闭曲面失败"
+        End If
+
+    Case "MOLD_CORE_CAVITY"
+        If Not MoldCoreCavity(gDoc, Val(KV(a, "D1")) / 1000#, Val(KV(a, "D2")) / 1000#, _
+                              Val(KV(a, "SETBACK")) / 1000#, Val(KV(a, "ANGLE")), KV(a, "NAME")) Then
+            ExecOp = "型心/型腔失败"
+        End If
+
+    Case "CHECK"
+        Call Report(gDoc, "CHECK")
+
+    Case "EXPORT"
+        If Not SaveStep(gDoc, KV(a, "OUT")) Then ExecOp = "导出失败: " & KV(a, "OUT")
+
+    Case "LOG"
+        Call L("  MSG: " & KV(a, "MSG"))
+
+    Case "SET"
+        gVars(KV(a, "NAME")) = KV(a, "VALUE")
+        Call L("  SET " & KV(a, "NAME") & " = " & KV(a, "VALUE"))
+
+    Case Else
+        ExecOp = "未知操作 " & op
+    End Select
+End Function
+
+
+'=====================================================================================
+' 文档 / 体
+'=====================================================================================
+Private Function EnsureDoc(swApp As Object, src As String, nm As String) As Object
+    Dim errs As Long
+    Dim m As Object
+    Call CloseStaleDoc(swApp, src)
+    Set m = swApp.LoadFile4(src, "r", Nothing, errs)
+    Call L("  LoadFile4 errors=" & CStr(errs) & "  " & src)
+    If m Is Nothing Then Exit Function
+    Set EnsureDoc = m
+    If Len(nm) > 0 Then Set gDocs(nm) = m
+    Call L("  当前文档 = " & m.GetTitle)
+End Function
+
+Private Function GetDoc(nm As String) As Object
+    If gDocs.Exists(nm) Then
+        Set GetDoc = gDocs(nm)
+    Else
+        Set GetDoc = Nothing
+    End If
+End Function
+
+Private Sub CloseStaleDoc(swApp As Object, src As String)
+    Dim docs As Variant
+    Dim i As Long
+    Dim want As String
+    want = BaseNameNoExt(src)
+    On Error Resume Next
+    docs = swApp.GetDocuments
+    If Not IsEmpty(docs) Then
+        For i = LBound(docs) To UBound(docs)
+            If Not docs(i) Is Nothing Then
+                If StrComp(BaseNameNoExt(docs(i).GetTitle), want, vbTextCompare) = 0 Then
+                    Call L("  关闭残留文档 " & docs(i).GetTitle)
+                    swApp.CloseDoc docs(i).GetTitle
+                End If
+            End If
+        Next i
+    End If
+    On Error GoTo 0
+End Sub
+
+' 按名字取曲面体
+'   key 空         → 当前文档的第 0 个曲面体
+'   key = 文档别名 → 那个文档的第 0 个曲面体（作业里 TARGET 写的就是 IMPORT 的 NAME）
+'   否则           → 按体名匹配
+Private Function FindSurf(m As Object, key As String) As Object
+    Dim bs As Variant
+    Dim i As Long
+    Dim doc As Object
+    Set FindSurf = Nothing
+    key = Trim$(key)
+
+    If Len(key) > 0 Then
+        If gDocs.Exists(key) Then
+            Set doc = gDocs(key)
+            bs = doc.GetBodies2(BT_SURFACE, True)
+            If IsEmpty(bs) Then
+                Call L("    文档 " & key & " 里没有曲面体")
+            Else
+                Set FindSurf = bs(LBound(bs))
+                Call L("    终止曲面来自文档 " & key & " -> " & FindSurf.Name)
+            End If
+            Exit Function
+        End If
+    End If
+
+    bs = m.GetBodies2(BT_SURFACE, True)
+    If IsEmpty(bs) Then Exit Function
+    If Len(key) = 0 Then
+        Set FindSurf = bs(LBound(bs))
+        Exit Function
+    End If
+    For i = LBound(bs) To UBound(bs)
+        If StrComp(bs(i).Name, key, vbTextCompare) = 0 Then
+            Set FindSurf = bs(i)
+            Exit Function
+        End If
+    Next i
+    Call L("    可用曲面体: " & SurfsDebug(m))
+End Function
+
+Private Function SurfsDebug(m As Object) As String
+    Dim bs As Variant
+    Dim i As Long
+    Dim s As String
+    s = ""
+    bs = m.GetBodies2(BT_SURFACE, True)
+    If Not IsEmpty(bs) Then
+        For i = LBound(bs) To UBound(bs)
+            s = s & "[" & bs(i).Name & "]"
+        Next i
+    End If
+    SurfsDebug = s
+End Function
+
+' ★从特征反查它创建的实体★
+'   ★为什么必须这样做★：GetBodies2 的返回顺序【不是创建顺序】，而且不稳定
+'   （同一份作业，上一次产品在实体0、这一次在实体1）——
+'   用序号 "0"/"LAST" 指代实体，会静默组合出错误的体，
+'   体积看着"成功"其实完全不对（实测踩过：下模体积从 4,193,289 变成 91,906）。
+Private Function BodyOfFeature(feat As Object) As Object
+    Dim faces As Variant
+    Dim b As Object
+    Set BodyOfFeature = Nothing
+    If feat Is Nothing Then Exit Function
+    On Error Resume Next
+    faces = feat.GetFaces
+    If Not IsEmpty(faces) Then
+        Set b = faces(LBound(faces)).GetBody
+        Set BodyOfFeature = b
+    End If
+    If Err.Number <> 0 Then Err.Clear
+    On Error GoTo 0
+End Function
+
+' 取实体
+'   key = "@特征名"    → 该特征创建的实体（★首选，稳定★）
+'   key = "0"/"1"/...  → 按序号（不稳定，尽量别用）
+'   key = "LAST"       → 最后一个（不稳定，尽量别用）
+Private Function FindSolid(m As Object, key As String) As Object
+    Dim bs As Variant
+    Dim i As Long
+    Dim k As String
+    Set FindSolid = Nothing
+    k = Trim$(key)
+
+    If Left$(k, 1) = "@" Then
+        Dim nm As String
+        nm = Mid$(k, 2)
+        If gFeats.Exists(nm) Then
+            Set FindSolid = BodyOfFeature(gFeats(nm))
+            If FindSolid Is Nothing Then
+                Call L("    特征 " & nm & " 反查实体失败")
+            Else
+                Call L("    实体取自特征 " & nm & " -> " & FindSolid.Name)
+            End If
+        Else
+            Call L("    !! 没有名为 " & nm & " 的特征")
+        End If
+        Exit Function
+    End If
+
+    bs = m.GetBodies2(BT_SOLID, True)
+    If IsEmpty(bs) Then Exit Function
+    If UCase$(k) = "LAST" Then
+        Call L("    ⚠ 用 LAST 指代实体不可靠（顺序不稳定）")
+        Set FindSolid = bs(UBound(bs))
+        Exit Function
+    End If
+    i = Val(k)
+    If i < LBound(bs) Or i > UBound(bs) Then Exit Function
+    Set FindSolid = bs(i)
+End Function
+
+
+'=====================================================================================
+' 基准面
+'=====================================================================================
+Private Function MakePlaneAtZ(m As Object, z As Double, nm As String) As String
+    Dim baseName As String
+    Dim attempt As Long
+    Dim f As Object
+    Dim oz As Double
+    Dim ok As Variant
+    Dim existing As String
+
+    baseName = FindZPlane(m)
+    MakePlaneAtZ = ""
+
+    ' ★先找现成的★
+    '   同一份作业里经常会重复要同一个高度的基准面（例如下模既要"棱柱底面"
+    '   又要"基座底面"）。重复建会生出好几个同高平面，而且实测偶发失败
+    '   （"建基准面彻底失败"），流程就会静默降级到更差的内缩量。
+    '   已经有一个落在目标高度的，就直接复用。
+    existing = FindPlaneAtZ(m, z)
+    If Len(existing) > 0 Then
+        Call L("    复用已有基准面 " & existing & " (z=" & Fmt(z * 1000#) & "mm)")
+        If Len(nm) > 0 Then gPlanes(nm) = existing
+        MakePlaneAtZ = existing
+        Exit Function
+    End If
+
+    For attempt = 0 To 3
+        m.ClearSelection2 True
+        ok = m.Extension.SelectByID2(baseName, "PLANE", 0, 0, 0, False, 0, Nothing, 0)
+        Set f = Nothing
+        On Error Resume Next
+        Set f = m.FeatureManager.InsertRefPlane(8 + attempt * 256, Abs(z), 0, 0, 0, 0)
+        If Err.Number <> 0 Then
+            Call L("    InsertRefPlane 抛错 " & CStr(Err.Number) & " : " & Err.Description)
+            Err.Clear
+        End If
+        On Error GoTo 0
+        If f Is Nothing Then
+            Call L("    InsertRefPlane 返回 Nothing (flip=" & CStr(attempt) & ")")
+        Else
+            oz = PlaneOriginZ(m, f.Name)
+            Call L("    基准面 " & f.Name & " z=" & Fmt(oz * 1000#) & "mm 目标=" & Fmt(z * 1000#) & "mm")
+            If Abs(oz - z) < 0.0001 Then
+                MakePlaneAtZ = f.Name
+                If Len(nm) > 0 Then gPlanes(nm) = f.Name
+                Set gFeats(nm) = f
+                Exit Function
+            End If
+            m.ClearSelection2 True
+            ok = m.Extension.SelectByID2(f.Name, "PLANE", 0, 0, 0, False, 0, Nothing, 0)
+            On Error Resume Next
+            m.EditDelete
+            On Error GoTo 0
+        End If
+    Next attempt
+    Call L("    !! 建基准面彻底失败")
+End Function
+
+' 基准面名解析：允许直接写系统基准面名
+Private Function PlaneName(key As String) As String
+    If Len(key) = 0 Then
+        PlaneName = ""
+    ElseIf gPlanes.Exists(key) Then
+        PlaneName = gPlanes(key)
+    Else
+        PlaneName = key
+    End If
+End Function
+
+Private Function SketchName(key As String) As String
+    If gSketches.Exists(key) Then
+        SketchName = gSketches(key)
+    Else
+        SketchName = key
+    End If
+End Function
+
+
+'=====================================================================================
+' 草图
+'=====================================================================================
+Private Function SketchPoly(m As Object, planeName As String, polyPath As String, nm As String) As String
+    Dim f As Integer
+    Dim n As Long, i As Long, cnt As Long
+    Dim xs() As Double, ys() As Double
+    Dim dx0 As Double, dy0 As Double
+    Dim feat As Object
+    Dim ok As Variant
+
+    SketchPoly = ""
+    If Len(planeName) = 0 Then
+        Call L("    !! 基准面名为空")
+        Exit Function
+    End If
+    If Dir(polyPath) = "" Then
+        Call L("    !! 点表不存在 " & polyPath)
+        Exit Function
+    End If
+
+    f = FreeFile
+    Open polyPath For Input As #f
+    On Error Resume Next
+    Input #f, n
+    If Err.Number <> 0 Or n < 3 Then
+        Call L("    !! 读点数失败 n=" & CStr(n))
+        Close #f
+        Err.Clear
+        On Error GoTo 0
+        Exit Function
+    End If
+    ReDim xs(1 To n)
+    ReDim ys(1 To n)
+    For i = 1 To n
+        Input #f, xs(i), ys(i)
+    Next i
+    Close #f
+    If Err.Number <> 0 Then
+        Call L("    !! 读点失败")
+        Err.Clear
+        On Error GoTo 0
+        Exit Function
+    End If
+    On Error GoTo 0
+
+    ' ★去掉重复收尾点★
+    If n >= 2 Then
+        dx0 = xs(n) - xs(1)
+        dy0 = ys(n) - ys(1)
+        If Sqr(dx0 * dx0 + dy0 * dy0) < 0.000001 Then
+            Call L("    收尾点与首点重合，按 " & CStr(n - 1) & " 点处理")
+            n = n - 1
+        End If
+    End If
+    If n < 3 Then
+        Call L("    !! 有效点数不足")
+        Exit Function
+    End If
+
+    m.ClearSelection2 True
+    ok = m.Extension.SelectByID2(planeName, "PLANE", 0, 0, 0, False, 0, Nothing, 0)
+    m.SketchManager.InsertSketch True
+    cnt = 0
+    For i = 1 To n - 1
+        m.SketchManager.CreateLine xs(i) / 1000#, ys(i) / 1000#, 0#, _
+                                  xs(i + 1) / 1000#, ys(i + 1) / 1000#, 0#
+        cnt = cnt + 1
+    Next i
+    m.SketchManager.CreateLine xs(n) / 1000#, ys(n) / 1000#, 0#, _
+                              xs(1) / 1000#, ys(1) / 1000#, 0#
+    cnt = cnt + 1
+    m.ClearSelection2 True
+    m.SketchManager.InsertSketch True
+    Set feat = m.FeatureByPositionReverse(0)
+    If feat Is Nothing Then Exit Function
+    SketchPoly = feat.Name
+    If Len(nm) > 0 Then gSketches(nm) = feat.Name
+    Set gFeats(nm) = feat
+    Call L("    草图 " & feat.Name & " = " & CStr(cnt) & " 条线 / " & CStr(n) & " 顶点")
+End Function
+
+
+Private Function SketchRect(m As Object, planeName As String, x1 As Double, y1 As Double, _
+                            x2 As Double, y2 As Double, nm As String) As String
+    Dim feat As Object
+    Dim ok As Variant
+    SketchRect = ""
+    If Len(planeName) = 0 Then
+        Call L("    !! 基准面名为空")
+        Exit Function
+    End If
+    m.ClearSelection2 True
+    ok = m.Extension.SelectByID2(planeName, "PLANE", 0, 0, 0, False, 0, Nothing, 0)
+    If Not ok Then
+        Call L("    !! 选不中基准面 " & planeName)
+        Exit Function
+    End If
+    m.SketchManager.InsertSketch True
+    ' ★CreateCornerRectangle 返回草图实体数组，只能语句形式调用★
+    m.SketchManager.CreateCornerRectangle x1 / 1000#, y1 / 1000#, 0#, x2 / 1000#, y2 / 1000#, 0#
+    m.ClearSelection2 True
+    m.SketchManager.InsertSketch True
+    Set feat = m.FeatureByPositionReverse(0)
+    If feat Is Nothing Then Exit Function
+    SketchRect = feat.Name
+    If Len(nm) > 0 Then gSketches(nm) = feat.Name
+    Set gFeats(nm) = feat
+    Call L("    矩形草图 " & feat.Name & " x[" & Fmt(x1) & "," & Fmt(x2) & _
+           "] y[" & Fmt(y1) & "," & Fmt(y2) & "]")
+End Function
+
+
+'=====================================================================================
+' 特征
+'=====================================================================================
+' MERGE=0 时新拉伸会成为一个【独立实体】（多实体布尔必须这样）
+Private Function BossBlind(m As Object, skName As String, upM As Double, dnM As Double, _
+                           nm As String, Optional merge As Boolean = True) As String
+    Dim feat As Object
+    Dim ok As Variant
+    BossBlind = ""
+    m.ClearSelection2 True
+    ok = m.Extension.SelectByID2(skName, "SKETCH", 0, 0, 0, False, MK_SKETCH, Nothing, 0)
+    If dnM > 0# Then
+        Set feat = m.FeatureManager.FeatureExtrusion3( _
+            False, False, False, EC_BLIND, 0, upM, dnM, _
+            False, False, False, False, 0#, 0#, _
+            False, False, False, False, merge, True, True, _
+            ST_SKETCHPLANE, 0#, False)
+    Else
+        Set feat = m.FeatureManager.FeatureExtrusion3( _
+            True, False, False, EC_BLIND, 0, upM, 0#, _
+            False, False, False, False, 0#, 0#, _
+            False, False, False, False, merge, True, True, _
+            ST_SKETCHPLANE, 0#, False)
+    End If
+    If feat Is Nothing Then Exit Function
+    BossBlind = feat.Name
+    Set gFeats(nm) = feat
+    Call L("    盲拉伸 " & feat.Name & " up=" & Fmt(upM * 1000#) & "mm dn=" & Fmt(dnM * 1000#) & "mm merge=" & CStr(merge))
+End Function
+
+
+' 成形到曲面（凸台 or 切除）
+'   DIR 是"应该往哪边拉"；再根据草图基准面的实际法向换算成 API 的 Dir 翻转位
+Private Function UptoSurface(m As Object, skName As String, targetKey As String, _
+                             planeName As String, dirText As String, asCut As Boolean, _
+                             nm As String) As String
+    Dim surf As Object
+    Dim nz As Double
+    Dim wantDown As Boolean
+    Dim dirFlip As Boolean
+    Dim feat As Object
+    Dim okS As Variant, okF As Boolean
+    Dim endTypes(0 To 1) As Long
+    Dim i As Long
+    Dim how As String
+
+    UptoSurface = ""
+    Set surf = FindSurf(m, targetKey)
+    If surf Is Nothing Then
+        Call L("    !! 找不到终止曲面 [" & targetKey & "]")
+        Exit Function
+    End If
+
+    nz = 1#
+    If Len(planeName) > 0 Then nz = PlaneNormalZ(m, planeName)
+    wantDown = (UCase$(Trim$(dirText)) <> "UP")
+    ' 凸台默认沿草图法向；切除默认与草图法向相反
+    If asCut Then
+        dirFlip = (wantDown And nz < 0#) Or ((Not wantDown) And nz > 0#)
+    Else
+        dirFlip = (wantDown And nz > 0#) Or ((Not wantDown) And nz < 0#)
+    End If
+    If asCut Then
+        how = "切除"
+    Else
+        how = "凸台"
+    End If
+    Call L("    " & how & ": 法向Z=" & Fmt(nz) & " 目标方向=" & dirText & " → Dir=" & CStr(dirFlip))
+
+    endTypes(0) = EC_UPTOSURFACE
+    endTypes(1) = EC_UPTOSELECTION
+    For i = 0 To 1
+        m.ClearSelection2 True
+        okS = m.Extension.SelectByID2(skName, "SKETCH", 0, 0, 0, False, MK_SKETCH, Nothing, 0)
+        ' ★终止条件参考实体用 mark 1；只用 SURFACEBODY（FACE+mark2 会把 SW 打崩）★
+        okF = m.Extension.SelectByID2(surf.Name, "SURFACEBODY", 0, 0, 0, True, MK_ENDREF, Nothing, 0)
+        Set feat = Nothing
+        On Error Resume Next
+        If asCut Then
+            Set feat = m.FeatureManager.FeatureCut4( _
+                True, False, dirFlip, endTypes(i), 0, 0#, 0#, _
+                False, False, False, False, 0#, 0#, _
+                False, False, False, False, False, _
+                True, True, False, False, False, _
+                ST_SKETCHPLANE, 0#, False, False)
+        Else
+            Set feat = m.FeatureManager.FeatureExtrusion3( _
+                True, False, dirFlip, endTypes(i), 0, 0#, 0#, _
+                False, False, False, False, 0#, 0#, _
+                False, False, False, False, _
+                True, True, True, _
+                ST_SKETCHPLANE, 0#, False)
+        End If
+        If Err.Number <> 0 Then
+            Call L("      抛错 " & CStr(Err.Number) & " : " & Err.Description)
+            Err.Clear
+        End If
+        On Error GoTo 0
+        If Not feat Is Nothing Then
+            UptoSurface = feat.Name
+            Set gFeats(nm) = feat
+            Call L("    " & how & "成形到曲面 OK -> " & feat.Name & " (T1=" & CStr(endTypes(i)) & ")")
+            Exit Function
+        End If
+        Call L("      T1=" & CStr(endTypes(i)) & " 返回 Nothing")
+    Next i
+    Call L("    !! 成形到曲面失败")
+End Function
+
+
+'=====================================================================================
+' 组合 / 删体
+'=====================================================================================
+' 组合（SW 官方示例的用法）
+'   ★关键★ InsertCombineFeature 不是"把体传进去"，而是：
+'     1) 先用 SelectByID2 把实体【选中】，且 selection mark = 2
+'        （主实体第一个选，Append=False；工具体接着选，Append=True）
+'     2) 再调 InsertCombineFeature(类型, Nothing, Nothing)
+'   直接把 Body2 当参数传 → 返回 Nothing（实测踩过）
+' 使用曲面切除：把实体按曲面切开，保留其中一半
+'   ★关键★ 实体必须被曲面【切断】。做法是让实体的 XY = 曲面的投影轮廓，
+'   这样曲面的边界环正好落在实体侧壁上，实体就没有"绕过去"的余地。
+'   （早期失败的那次是把实体做成比曲面大 5mm 的盒子 —— 边界整圈悬在实体内部，
+'     SW 认为切不开，返回 err=0 但几何一位不差。）
+Private Function CutBySurface(m As Object, surfKey As String, targetKey As String, _
+                              keepText As String, nm As String) As Boolean
+    Dim surf As Object
+    Dim tgt As Object
+    Dim targets As Variant
+    Dim feat As Object
+    Dim errOut As Long
+    Dim keepAbove As Boolean
+    Dim ok As Variant
+    Dim before As Double, after As Double
+
+    CutBySurface = False
+    Set surf = FindSurf(m, surfKey)
+    If surf Is Nothing Then
+        Call L("    !! 找不到刀体曲面 [" & surfKey & "]")
+        Exit Function
+    End If
+    Set tgt = FindSolid(m, targetKey)
+    If tgt Is Nothing Then
+        Call L("    !! 找不到被切实体 [" & targetKey & "]")
+        Exit Function
+    End If
+    targets = Array(tgt)
+    keepAbove = (UCase$(Trim$(keepText)) <> "BELOW")
+
+    before = 0#
+    On Error Resume Next
+    before = tgt.GetMassProperties(0)(3)
+    On Error GoTo 0
+
+    m.ClearSelection2 True
+    ok = m.Extension.SelectByID2(surf.Name, "SURFACEBODY", 0, 0, 0, False, 0, Nothing, 0)
+    Call L("    刀体曲面 " & surf.Name & " 选中=" & CStr(ok))
+    Call L("    被切实体 " & tgt.Name & " volume=" & CStr(before) & "  keep=" & keepText)
+
+    errOut = 0
+    Set feat = Nothing
+    On Error Resume Next
+    Set feat = m.FeatureManager.InsertCutSurface(Not keepAbove, 0, True, True, targets, errOut)
+    If Err.Number <> 0 Then
+        Call L("    InsertCutSurface 抛错 " & CStr(Err.Number) & " : " & Err.Description)
+        Err.Clear
+    End If
+    On Error GoTo 0
+    If feat Is Nothing Then
+        Call L("    !! InsertCutSurface 返回 Nothing (err=" & CStr(errOut) & ")")
+        Exit Function
+    End If
+    Set gFeats(nm) = feat
+    ' ★事后复核体积★：SW 可能"成功"但几何没变（不切断时的静默失败）
+    after = 0#
+    On Error Resume Next
+    after = tgt.GetMassProperties(0)(3)
+    On Error GoTo 0
+    Call L("    曲面切除 OK -> " & feat.Name & " (err=" & CStr(errOut) & ") 体积 " & _
+           CStr(before) & " -> " & CStr(after))
+    If Abs(after - before) < 1E-12 Then
+        Call L("    !! 体积没变 —— 曲面没能把实体切断（静默失败）")
+        Exit Function
+    End If
+    CutBySurface = True
+End Function
+
+
+Private Function Combine(m As Object, opText As String, mainKey As String, toolKey As String, _
+                         nm As String) As Boolean
+    Dim mainB As Object
+    Dim bs As Variant
+    Dim i As Long, n As Long
+    Dim opType As Long
+    Dim feat As Object
+    Dim tb As Object
+    Dim ok As Variant
+    Dim toolArr As Variant
+    Dim tools() As Variant
+    Dim tried As String
+
+    Combine = False
+    Set mainB = FindSolid(m, mainKey)
+    If mainB Is Nothing Then
+        Call L("    !! 找不到主实体 [" & mainKey & "]")
+        Exit Function
+    End If
+    bs = m.GetBodies2(BT_SOLID, True)
+    If IsEmpty(bs) Then Exit Function
+
+    Select Case UCase$(Trim$(opText))
+        Case "CUT": opType = BOP_CUT
+        Case "ADD": opType = BOP_ADD
+        Case "COMMON", "INTERSECT": opType = BOP_INTERSECT
+        Case Else
+            Call L("    !! 未知组合类型 " & opText)
+            Exit Function
+    End Select
+    Call L("    组合类型 " & opText & " -> opType=" & CStr(opType))
+
+    ' 先收集工具体
+    n = 0
+    If UCase$(Trim$(toolKey)) = "ALL" Then
+        For i = LBound(bs) To UBound(bs)
+            If Not bs(i) Is mainB Then
+                n = n + 1
+                ReDim Preserve tools(1 To n)
+                Set tools(n) = bs(i)
+            End If
+        Next i
+    Else
+        Set tb = FindSolid(m, toolKey)
+        If tb Is Nothing Then
+            Call L("    !! 找不到工具实体 [" & toolKey & "]")
+            Exit Function
+        End If
+        n = 1
+        ReDim tools(1 To 1)
+        Set tools(1) = tb
+    End If
+    If n = 0 Then
+        Call L("    !! 没有工具体")
+        Exit Function
+    End If
+    Call L("    主实体=" & mainB.Name & "  工具体数=" & CStr(n))
+
+    ' ---------- 路线②：直接传体（先记录，不执行）----------
+    toolArr = tools
+
+    ' ---------- 路线①：官方示例用法（选中 + mark=2 + 参数传 Nothing）----------
+    m.ClearSelection2 True
+    ok = m.Extension.SelectByID2(mainB.Name, "SOLIDBODY", 0, 0, 0, False, 2, Nothing, 0)
+    Call L("    路线① 选中主实体=" & CStr(ok) & " (mark=2)")
+    If UCase$(Trim$(toolKey)) = "ALL" Then
+        For i = 1 To n
+            ok = m.Extension.SelectByID2(tools(i).Name, "SOLIDBODY", 0, 0, 0, True, 2, Nothing, 0)
+        Next i
+    Else
+        ok = m.Extension.SelectByID2(tools(1).Name, "SOLIDBODY", 0, 0, 0, True, 2, Nothing, 0)
+        Call L("    路线① 选中工具体=" & CStr(ok))
+    End If
+
+    Set feat = Nothing
+    On Error Resume Next
+    Set feat = m.FeatureManager.InsertCombineFeature(opType, Nothing, Nothing)
+    If Err.Number <> 0 Then
+        Call L("    路线① 抛错 " & CStr(Err.Number) & " : " & Err.Description)
+        Err.Clear
+    End If
+    On Error GoTo 0
+    If Not feat Is Nothing Then
+        Call L("    ★ 组合成功（路线①：选中+Nothing） -> " & feat.Name)
+        Set gFeats(nm) = feat
+        Combine = True
+        Exit Function
+    End If
+    Call L("    路线① 返回 Nothing，改试路线②（直接传体）")
+
+    ' ---------- 路线②：直接传 MainBody + 工具体数组 ----------
+    Set feat = Nothing
+    On Error Resume Next
+    Set feat = m.FeatureManager.InsertCombineFeature(opType, mainB, toolArr)
+    If Err.Number <> 0 Then
+        Call L("    路线② 抛错 " & CStr(Err.Number) & " : " & Err.Description)
+        Err.Clear
+    End If
+    On Error GoTo 0
+    If feat Is Nothing Then
+        Call L("    !! 两条路线都返回 Nothing —— 组合失败")
+        Exit Function
+    End If
+    Call L("    ★ 组合成功（路线②：直接传体） -> " & feat.Name)
+    Set gFeats(nm) = feat
+    Combine = True
+End Function
+
+
+Private Sub DeleteSurfaces(m As Object)
+    Dim bs As Variant
+    Dim s As Variant
+    Dim ok As Variant
+    Dim attempt As Long
+    Dim n As Long
+
+    For attempt = 0 To 2
+        bs = m.GetBodies2(BT_SURFACE, True)
+        If IsEmpty(bs) Then
+            Call L("    曲面体已清空")
+            Exit Sub
+        End If
+        m.ClearSelection2 True
+        n = 0
+        For Each s In bs
+            ok = m.Extension.SelectByID2(s.Name, "SURFACEBODY", 0, 0, 0, True, 0, Nothing, 0)
+            If ok Then n = n + 1
+        Next s
+        If n = 0 Then Exit Sub
+        On Error Resume Next
+        m.EditDelete
+        If Err.Number <> 0 Then Err.Clear
+        m.Extension.DeleteSelection2 0
+        If Err.Number <> 0 Then Err.Clear
+        On Error GoTo 0
+    Next attempt
+    bs = m.GetBodies2(BT_SURFACE, True)
+    If IsEmpty(bs) Then
+        Call L("    曲面体已清空")
+    Else
+        Call L("    !! 仍有 " & CStr(UBound(bs) - LBound(bs) + 1) & _
+               " 个曲面体删不掉（被特征引用）—— 导出会是曲面模型，需外部后处理归一化")
+    End If
+End Sub
+
+
+Private Function KeepBodies(m As Object, idx As Long) As Boolean
+    Dim bs As Variant
+    Dim keepArr As Variant
+    Dim feat As Object
+
+    KeepBodies = False
+    bs = m.GetBodies2(BT_SOLID, True)
+    If IsEmpty(bs) Then Exit Function
+    If idx < LBound(bs) Or idx > UBound(bs) Then
+        Call L("    !! 实体序号越界 " & CStr(idx))
+        Exit Function
+    End If
+    keepArr = Array(bs(idx))
+    Set feat = Nothing
+    On Error Resume Next
+    Set feat = m.FeatureManager.InsertDeleteBody2(keepArr)
+    If Err.Number <> 0 Then
+        Call L("    InsertDeleteBody2 抛错 " & CStr(Err.Number) & " : " & Err.Description)
+        Err.Clear
+    End If
+    On Error GoTo 0
+    If feat Is Nothing Then
+        Call L("    !! InsertDeleteBody2 返回 Nothing")
+        Exit Function
+    End If
+    Call L("    保留实体 " & CStr(idx) & " 成功")
+    KeepBodies = True
+End Function
+
+
+'=====================================================================================
+' 模具工具（SolidWorks Mold Design 工作流）
+'   分型线 → 分型面 → 关闭曲面 → 型心/型腔
+'   ★这些是 SW 自带"模具工具"工具栏背后的 API。它们是为【实心零件】设计的：
+'     要求零件有明确的分型线（拔模分析能分出上下），而本项目输入常常是
+'     薄壁板料件，分型线可能落在板厚方向 → 有可能失败。失败时日志会说明。
+'=====================================================================================
+Private Function DraftAnalysis(m As Object, dirText As String, angleDeg As Double) As Boolean
+    Dim ok As Boolean
+    DraftAnalysis = False
+    On Error Resume Next
+    ok = m.Extension.SelectByID2("", "PLANE", 0, 0, 0, False, 0, Nothing, 0)
+    ' 拔模分析不是必须的，这里只做记录（真正分型由分型线特征完成）
+    Call L("    拔模分析请求: 方向=" & dirText & " 角度=" & Fmt(angleDeg) & "°（本引擎不做分析，仅记录）")
+    On Error GoTo 0
+End Function
+
+Private Function MoldPartingLine(m As Object, flip As Boolean, nm As String) As Boolean
+    Dim feat As Object
+    MoldPartingLine = False
+    Set feat = Nothing
+    On Error Resume Next
+    Set feat = m.FeatureManager.InsertMoldPartingLine(flip)
+    If Err.Number <> 0 Then
+        Call L("    InsertMoldPartingLine 抛错 " & CStr(Err.Number) & " : " & Err.Description)
+        Err.Clear
+    End If
+    On Error GoTo 0
+    If feat Is Nothing Then
+        Call L("    !! 分型线返回 Nothing（通常是没有可识别的分型边）")
+        Exit Function
+    End If
+    Set gFeats(nm) = feat
+    Call L("    分型线 OK -> " & feat.Name)
+    MoldPartingLine = True
+End Function
+
+Private Function MoldPartingSurface(m As Object, nm As String) As Boolean
+    Dim feat As Object
+    Dim radiate As Boolean, revAlign As Boolean, revOff As Boolean
+    Dim off As Double, ang As Double, smooth As Boolean, smoothD As Double, knit As Boolean
+    MoldPartingSurface = False
+    radiate = True: revAlign = False: revOff = False
+    off = 0.005: ang = 0#: smooth = True: smoothD = 0.001: knit = True
+    Set feat = Nothing
+    On Error Resume Next
+    Set feat = m.FeatureManager.InsertMoldPartingSurface(radiate, revAlign, revOff, _
+                                                         off, ang, smooth, smoothD, knit)
+    If Err.Number <> 0 Then
+        Call L("    InsertMoldPartingSurface 抛错 " & CStr(Err.Number) & " : " & Err.Description)
+        Err.Clear
+    End If
+    On Error GoTo 0
+    If feat Is Nothing Then
+        Call L("    !! 分型面返回 Nothing（需要先选中分型线边，mark=4）")
+        Exit Function
+    End If
+    Set gFeats(nm) = feat
+    Call L("    分型面 OK -> " & feat.Name)
+    MoldPartingSurface = True
+End Function
+
+Private Function MoldShutOff(m As Object, nm As String) As Boolean
+    Dim feat As Object
+    MoldShutOff = False
+    Set feat = Nothing
+    On Error Resume Next
+    Set feat = m.FeatureManager.InsertMoldShutOffSurface
+    If Err.Number <> 0 Then
+        Call L("    InsertMoldShutOffSurface 抛错 " & CStr(Err.Number) & " : " & Err.Description)
+        Err.Clear
+    End If
+    On Error GoTo 0
+    If feat Is Nothing Then
+        Call L("    !! 关闭曲面返回 Nothing")
+        Exit Function
+    End If
+    Set gFeats(nm) = feat
+    Call L("    关闭曲面 OK -> " & feat.Name)
+    MoldShutOff = True
+End Function
+
+Private Function MoldCoreCavity(m As Object, d1 As Double, d2 As Double, _
+                                setback As Double, ang As Double, nm As String) As Boolean
+    Dim feat As Object
+    MoldCoreCavity = False
+    Set feat = Nothing
+    On Error Resume Next
+    Set feat = m.FeatureManager.InsertMoldCoreCavitySolids(d1, d2, setback, ang)
+    If Err.Number <> 0 Then
+        Call L("    InsertMoldCoreCavitySolids 抛错 " & CStr(Err.Number) & " : " & Err.Description)
+        Err.Clear
+    End If
+    On Error GoTo 0
+    If feat Is Nothing Then
+        Call L("    !! 型心/型腔返回 Nothing（需要先有分型面）")
+        Exit Function
+    End If
+    Set gFeats(nm) = feat
+    Call L("    型心/型腔 OK -> " & feat.Name)
+    MoldCoreCavity = True
+End Function
+
+
+'=====================================================================================
+' 汇报 / 导出
+'=====================================================================================
+Private Sub Report(m As Object, tag As String)
+    Dim ss As Variant, fs As Variant
+    Dim v As Variant, mp As Variant
+    Dim i As Long
+
+    ss = m.GetBodies2(BT_SOLID, True)
+    fs = m.GetBodies2(BT_SURFACE, True)
+    Call L("  [" & tag & "] 实体数=" & CStr(CountArr(ss)) & "  曲面数=" & CStr(CountArr(fs)))
+    If Not IsEmpty(ss) Then
+        For i = LBound(ss) To UBound(ss)
+            v = ss(i).GetBodyBox
+            mp = ss(i).GetMassProperties(0)
+            Call L("    实体" & CStr(i) & " " & ss(i).Name & " 体积=" & CStr(mp(3)) & " m^3" & _
+                   " bbox x[" & Fmt(v(0) * 1000#) & "," & Fmt(v(3) * 1000#) & _
+                   "] y[" & Fmt(v(1) * 1000#) & "," & Fmt(v(4) * 1000#) & _
+                   "] z[" & Fmt(v(2) * 1000#) & "," & Fmt(v(5) * 1000#) & "] mm")
+        Next i
+    End If
+End Sub
+
+Private Function CountArr(a As Variant) As Long
+    If IsEmpty(a) Then
+        CountArr = 0
+    Else
+        CountArr = UBound(a) - LBound(a) + 1
+    End If
+End Function
+
+Private Function SaveStep(m As Object, path As String) As Boolean
+    Dim errs As Long, warns As Long
+    SaveStep = False
+    m.Extension.SaveAs path, 0, 1, Nothing, errs, warns
+    Call L("    SaveAs errors=" & CStr(errs) & " warns=" & CStr(warns) & " -> " & path)
+    If Dir(path) <> "" Then SaveStep = True
+End Function
+
+
+'=====================================================================================
+' 基准面工具
+'=====================================================================================
+Private Function FindZPlane(m As Object) As String
+    Dim swFeat As Object
+    Dim swRef As Object
+    Dim xf As Object
+    Dim d As Variant
+    Dim bestName As String
+    bestName = ""
+    On Error Resume Next
+    Set swFeat = m.FirstFeature
+    Do While Not swFeat Is Nothing
+        If swFeat.GetTypeName2 = "RefPlane" Then
+            Set swRef = swFeat.GetSpecificFeature2
+            Set xf = swRef.Transform
+            d = xf.ArrayData
+            If IsArray(d) Then
+                If Abs(d(6)) < 0.000001 And Abs(d(7)) < 0.000001 Then
+                    If Abs(Abs(d(8)) - 1#) < 0.000001 Then bestName = swFeat.Name
+                End If
+            End If
+        End If
+        Set swFeat = swFeat.GetNextFeature
+    Loop
+    On Error GoTo 0
+    If Len(bestName) = 0 Then bestName = "前视基准面"
+    FindZPlane = bestName
+End Function
+
+Private Function PlaneArray(m As Object, planeName As String, ByRef d As Variant) As Boolean
+    Dim swFeat As Object
+    Dim swRef As Object
+    Dim xf As Object
+    PlaneArray = False
+    On Error Resume Next
+    Set swFeat = m.FirstFeature
+    Do While Not swFeat Is Nothing
+        If swFeat.GetTypeName2 = "RefPlane" And swFeat.Name = planeName Then
+            Set swRef = swFeat.GetSpecificFeature2
+            Set xf = swRef.Transform
+            d = xf.ArrayData
+            If IsArray(d) Then PlaneArray = True
+            Exit Do
+        End If
+        Set swFeat = swFeat.GetNextFeature
+    Loop
+    On Error GoTo 0
+End Function
+
+Private Function PlaneOriginZ(m As Object, planeName As String) As Double
+    Dim d As Variant
+    PlaneOriginZ = 0#
+    If PlaneArray(m, planeName, d) Then PlaneOriginZ = d(11)
+End Function
+
+Private Function PlaneNormalZ(m As Object, planeName As String) As Double
+    Dim d As Variant
+    PlaneNormalZ = 1#
+    If PlaneArray(m, planeName, d) Then PlaneNormalZ = d(8)
+End Function
+
+' 找有没有已经落在 z 高度的基准面（±0.01mm）
+Private Function FindPlaneAtZ(m As Object, z As Double) As String
+    Dim swFeat As Object
+    Dim d As Variant
+    Dim oz As Double
+    FindPlaneAtZ = ""
+    On Error Resume Next
+    Set swFeat = m.FirstFeature
+    Do While Not swFeat Is Nothing
+        If swFeat.GetTypeName2 = "RefPlane" Then
+            d = Empty
+            If PlaneArray(m, swFeat.Name, d) Then
+                If IsArray(d) Then
+                    If Abs(d(6)) < 0.000001 And Abs(d(7)) < 0.000001 Then
+                        If Abs(Abs(d(8)) - 1#) < 0.000001 Then
+                            oz = d(11)
+                            If Abs(oz - z) < 0.00001 Then
+                                FindPlaneAtZ = swFeat.Name
+                                Exit Do
+                            End If
+                        End If
+                    End If
+                End If
+            End If
+        End If
+        Set swFeat = swFeat.GetNextFeature
+    Loop
+    On Error GoTo 0
+End Function
+
+
+'=====================================================================================
+' 小工具
+'=====================================================================================
+Private Function JobPath() As String
+    JobPath = Environ$("TEMP") & "\" & JOB_NAME
+End Function
+
+Private Function OpName(ln As String) As String
+    Dim a As Variant
+    Dim t As String
+    Dim i As Long
+    a = Split(ln, "|")
+    For i = LBound(a) To UBound(a)
+        t = Trim$(a(i))
+        If UCase$(Left$(t, 3)) = "OP=" Then
+            OpName = UCase$(Trim$(Mid$(t, 4)))
+            Exit Function
+        End If
+    Next i
+    OpName = ""
+End Function
+
+Private Function KV(a As Variant, key As String) As String
+    Dim i As Long, t As String, p As Long
+    KV = ""
+    For i = LBound(a) To UBound(a)
+        t = Trim$(a(i))
+        p = InStr(t, "=")
+        If p > 0 Then
+            If UCase$(Trim$(Left$(t, p - 1))) = UCase$(key) Then
+                KV = Trim$(Mid$(t, p + 1))
+                Exit Function
+            End If
+        End If
+    Next i
+End Function
+
+Private Function Fmt(d As Double) As String
+    Fmt = Format$(d, "0.###")
+End Function
+
+Private Function BaseNameNoExt(p As String) As String
+    Dim s As String, i As Long
+    s = p
+    i = InStrRev(s, "\")
+    If i > 0 Then s = Mid$(s, i + 1)
+    i = InStrRev(s, "/")
+    If i > 0 Then s = Mid$(s, i + 1)
+    i = InStrRev(s, ".")
+    If i > 1 Then s = Left$(s, i - 1)
+    BaseNameNoExt = s
+End Function
+
+Private Function TemplatePath() As String
+    TemplatePath = "C:\ProgramData\SolidWorks\SOLIDWORKS 2024\templates\gb_part.prtdot"
+End Function

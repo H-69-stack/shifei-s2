@@ -1,0 +1,77 @@
+[
+  {
+    "name": "2ROM31-6061",
+    "success": true,
+    "utf8": true,
+    "src": "extrusion",
+    "punch_shells": 1,
+    "punch_bbox": [
+      -120.00097290668948,
+      -25.000972906689487,
+      2.999027093310512,
+      120.0009729066895,
+      25.000972906689487,
+      143.00372684686707
+    ],
+    "fit": {
+      "n": 117,
+      "max": 5.9998,
+      "p95": 0.0,
+      "mean": 0.0513,
+      "upper_faces_total": 13,
+      "lower_faces_total": 13
+    },
+    "interfere": 0.0,
+    "secs": 3.3
+  },
+  {
+    "name": "YA-1131",
+    "success": true,
+    "utf8": true,
+    "src": "protrusion",
+    "punch_shells": 1,
+    "punch_bbox": [
+      -325.9076852946589,
+      -1294.5456705628403,
+      -48991.972377813145,
+      325.9076852946254,
+      -862.9481720979726,
+      -48947.963148031115
+    ],
+    "fit": {
+      "n": 369,
+      "max": 15.4002,
+      "p95": 0.027,
+      "mean": 0.0866,
+      "upper_faces_total": 41,
+      "lower_faces_total": 49
+    },
+    "interfere": 0.0,
+    "secs": 99.1
+  },
+  {
+    "name": "YA-1238",
+    "success": true,
+    "utf8": true,
+    "src": "protrusion",
+    "punch_shells": 1,
+    "punch_bbox": [
+      -646.3653577938335,
+      -2261.659468534814,
+      -5868.82901816781,
+      646.3653577937716,
+      -1431.7344437155848,
+      -5778.824934928763
+    ],
+    "fit": {
+      "n": 459,
+      "max": 33.7151,
+      "p95": 0.0,
+      "mean": 0.158,
+      "upper_faces_total": 51,
+      "lower_faces_total": 59
+    },
+    "interfere": 0.0,
+    "secs": 212.2
+  }
+]

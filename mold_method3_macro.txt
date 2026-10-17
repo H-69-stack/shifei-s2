@@ -1,0 +1,977 @@
+'=====================================================================================
+' mold_method3_macro —— 模具生成法三（SolidWorks VBA），第 2 代
+'=====================================================================================
+' 【这一代换了思路】
+'   旧版：做一个比形变面大的盒体 → 用「使用曲面切除」把它切开。
+'         ✗ 失败原因：SW 要求曲面把实体【切断】。盒体四周都在形变面之外，
+'           形变面的边界整圈悬在实体内部 → 实体能从边界外侧绕过去 → 静默不切。
+'   新版：不要曲面切除，改用【成形到曲面】的拉伸 / 切除拉伸，
+'         终止位置由 SolidWorks 自己算。
+'
+'   上模 = 从高度面 P 向下「成形到曲面」拉到上形变面   （一个凸台拉伸特征）
+'   下模 = 基座块 − 从基座顶面向下「成形到曲面」切到下形变面（一个凸台 + 一个切除）
+'   —— 这两条正好等价于法二A（上模=形变面以上、下模=基座−下形变面以上）。
+'
+' 【已查证的关键 API 语义】（来源：SW 自带帮助 sldworksapi.chm，已解压核对）
+'   · FeatureExtrusion3 选择标记：
+'         3D草图=0   拉伸方向参考边=16   起始条件参考实体=32   终止条件参考实体=1
+'         当 UseAutoSelect=False 时要影响哪些实体 = 8
+'   · Dir = True 才是【翻转拉伸方向】；Flip 是「翻转切除侧」。
+'     凸台默认沿草图法向；切除默认与草图法向相反。
+'   · T1 终止条件：0=盲 4=成形到曲面 7=成形到实体 10=成形到选定(取代 4)
+'   · T0 起始条件：0=草图基准面 3=等距(配 StartOffset + FlipStartOffset)
+'   · InsertRefPlane(8, 距离, 0,0,0,0) —— 8 = swRefPlaneReferenceConstraint_Distance
+'   · SketchUseEdge3(Chain, InnerLoops) 返回 Boolean；
+'     InnerLoops=False 时【不】把面内环转成草图 → 天然把形变面上的洞补掉。
+'   · 选实体可以发生在草图【打开】期间（官方 Convert Entities 示例就是这么写的）。
+'   · InsertRefPlane 的距离方向不确定 → 本宏建完立刻读该基准面原点的 z 校验，
+'     不对就带 OptionFlip(256) 重建。
+'
+' 【单位】SW API 用【米】，配置里写【毫米】。
+' 【运行】SldWorks.RunMacro2(swp, "mold_method31", "RunM3", 0, Err)
+' 【注意】本文件不要粘贴 "Attribute VB_Name" 那一行，会编译报错。
+'=====================================================================================
+Option Explicit
+
+Private Const CFG_NAME As String = "mold3_cfg.txt"
+Private Const RES_NAME As String = "mold3_result.txt"
+Private Const LOG_NAME As String = "mold3_log.txt"
+
+' ---- swEndConditions_e ----
+Private Const EC_BLIND As Long = 0
+Private Const EC_UPTOSURFACE As Long = 4
+Private Const EC_UPTOBODY As Long = 7
+Private Const EC_UPTOSELECTION As Long = 10
+' ---- swStartConditions_e ----
+Private Const ST_SKETCHPLANE As Long = 0
+Private Const ST_OFFSET As Long = 3
+' ---- 选择标记 ----
+Private Const MK_SKETCH As Long = 0
+Private Const MK_ENDREF As Long = 1        ' ★ 终止条件参考实体
+Private Const MK_STARTREF As Long = 32     ' 起始条件参考实体
+Private Const MK_BODY As Long = 8
+' ---- 体类型 ----
+Private Const BT_SOLID As Long = 0
+Private Const BT_SURFACE As Long = 1
+
+
+'=====================================================================================
+' 日志
+'=====================================================================================
+Private Sub LogMsg(s As String)
+    Dim f As Integer
+    On Error Resume Next
+    f = FreeFile
+    Open Environ$("TEMP") & "\" & LOG_NAME For Append As #f
+    Print #f, s
+    Close #f
+    On Error GoTo 0
+End Sub
+
+
+'=====================================================================================
+' ★零参入口（RunMacro2 只能调零参 Public Sub）
+'=====================================================================================
+Public Sub RunM3()
+    Dim swApp As SldWorks.SldWorks
+    Dim logf As Integer
+    Dim mode As String
+    On Error GoTo Fail
+
+    logf = FreeFile
+    Open Environ$("TEMP") & "\" & LOG_NAME For Output As #logf
+    Close #logf
+    Call LogMsg("=== RunM3 (gen2) 开始 ===")
+
+    Set swApp = Application.SldWorks
+    If swApp Is Nothing Then
+        Call LogMsg("!! Application.SldWorks 为空")
+        WriteRes "ERR|0|swApp 为空"
+        Exit Sub
+    End If
+    Call LogMsg("SW 版本 revision=" & CStr(swApp.RevisionNumber))
+
+    mode = UCase$(Trim$(ReadCfg("MODE", "PUNCH")))
+    Call LogMsg("MODE = " & mode)
+    If mode = "CAVITY" Then
+        Call DoCavity(swApp)
+    Else
+        Call DoPunch(swApp)
+    End If
+
+    Call LogMsg("=== 完成 ===")
+    WriteRes "OK"
+    Exit Sub
+Fail:
+    Call LogMsg("!! 错误 " & CStr(Err.Number) & " : " & Err.Description)
+    WriteRes "ERR|" & CStr(Err.Number) & "|" & Err.Description
+End Sub
+
+
+'=====================================================================================
+' 上模：从高度面 P 向下「成形到曲面」拉到上形变面
+'=====================================================================================
+Private Sub DoPunch(swApp As SldWorks.SldWorks)
+    Dim src As String, outPath As String, surfName As String
+    Dim swModel As SldWorks.ModelDoc2
+    Dim x1 As Double, y1 As Double, z1 As Double
+    Dim x2 As Double, y2 As Double, z2 As Double
+    Dim dz As Double, h1Mm As Double, P As Double
+    Dim planeName As String, skName As String, nrm As Double
+    Dim dirFlip As Boolean
+    Dim feat As Object
+
+    src = ReadCfg("SRC", "")
+    outPath = ReadCfg("OUT", "")
+    Call LogMsg("SRC=" & src)
+    Call LogMsg("OUT=" & outPath)
+
+    Set swModel = LoadStep(swApp, src)
+    Call LogMsg("导入成功: " & swModel.GetTitle)
+
+    Call BodyBox(swModel, x1, y1, z1, x2, y2, z2)
+    dz = z2 - z1
+    h1Mm = Val(ReadCfg("H1", "0"))
+    If h1Mm <= 0# Then h1Mm = dz * 1000# + Val(ReadCfg("PPAD", "1"))
+    P = z1 + h1Mm / 1000#
+    Call LogMsg("上模 bbox z=[" & CStr(z1) & "," & CStr(z2) & "]  dz(mm)=" & CStr(dz * 1000#))
+    Call LogMsg("上模 H1(mm)=" & CStr(h1Mm) & "  →  高度面 P(mm)=" & CStr(P * 1000#))
+
+    surfName = FirstSurfaceName(swModel)
+
+    ' ① 在 z = P 建基准面
+    planeName = MakePlaneAtZ(swModel, P)
+    If Len(planeName) = 0 Then Err.Raise 5030, , "建 z=P 基准面失败"
+    nrm = PlaneNormalZ(swModel, planeName)
+
+    ' ② 在基准面上取形变面的投影轮廓
+    skName = MakeOutlineSketch(swModel, planeName, surfName, x1, y1, x2, y2)
+    If Len(skName) = 0 Then Err.Raise 5031, , "轮廓草图建立失败"
+
+    ' ③ 成形到曲面（凸台）。凸台默认沿草图法向；要向下就得在法向 +Z 时翻转。
+    dirFlip = (nrm > 0#)
+    Call LogMsg("凸台方向: 基准面法向Z=" & CStr(nrm) & "  Dir(翻转)=" & CStr(dirFlip))
+    Set feat = ExtrudeToSurface(swModel, skName, surfName, dirFlip, False)
+    If feat Is Nothing Then Err.Raise 5032, , "成形到曲面（凸台）失败"
+    Call LogMsg("上模特征 = " & feat.Name)
+
+    Call ReportSolid(swModel, "上模")
+
+    Call DeleteSurfaceBodies(swModel)
+    Call SaveStep(swModel, outPath)
+    Call LogMsg("导出完成: " & outPath)
+    swApp.CloseDoc swModel.GetTitle
+End Sub
+
+
+'=====================================================================================
+' 下模：基座块 − （基座顶面向下成形到曲面到下形变面）
+'=====================================================================================
+Private Sub DoCavity(swApp As SldWorks.SldWorks)
+    Dim src As String, outPath As String, surfName As String
+    Dim swModel As SldWorks.ModelDoc2
+    Dim x1 As Double, y1 As Double, z1 As Double
+    Dim x2 As Double, y2 As Double, z2 As Double
+    Dim dt As Double, hcMm As Double, margin As Double
+    Dim zTop As Double, zLo As Double, baseHz As Double, cutZ As Double
+    Dim zPlane As String, planeName As String, skName As String
+    Dim nrm As Double, dirFlip As Boolean
+    Dim feat As Object
+
+    src = ReadCfg("SRC", "")
+    outPath = ReadCfg("OUT", "")
+    Call LogMsg("SRC=" & src)
+    Call LogMsg("OUT=" & outPath)
+
+    Set swModel = LoadStep(swApp, src)
+    Call LogMsg("导入成功: " & swModel.GetTitle)
+
+    Call BodyBox(swModel, x1, y1, z1, x2, y2, z2)
+    dt = z2 - z1
+    hcMm = Val(ReadCfg("H_CAVITY", "0"))
+    If hcMm <= 0# Then hcMm = dt * 1000# + Val(ReadCfg("CPAD", "2"))
+    margin = Val(ReadCfg("MARGIN", "5")) / 1000#
+
+    zTop = z1 + hcMm / 1000#          ' 基座顶面（= 下形变面最低点 + 空腔高）
+    baseHz = hcMm / 1000# + dt        ' 基座总高 = 空腔高 + 底部垫厚
+    zLo = zTop - baseHz
+    Call LogMsg("下模 dt(mm)=" & CStr(dt * 1000#) & " 空腔高(mm)=" & CStr(hcMm) & _
+                " margin(mm)=" & CStr(margin * 1000#))
+    Call LogMsg("下模 基座 z=[" & CStr(zLo) & "," & CStr(zTop) & "]   xy 每边外扩 " & CStr(margin))
+
+    surfName = FirstSurfaceName(swModel)
+
+    ' ① 基座块：在前视基准面上画矩形，双向盲拉伸（这条路旧版已验证可行）
+    zPlane = FindZPlane(swModel)
+    Call BossBlind(swModel, zPlane, x1 - margin, y1 - margin, x2 + margin, y2 + margin, zTop, -zLo)
+
+    ' ② 切除面所在基准面（比基座顶面抬高一点点，避免与顶面共面）
+    cutZ = zTop + Val(ReadCfg("CUTLIFT", "0.5")) / 1000#
+    planeName = MakePlaneAtZ(swModel, cutZ)
+    If Len(planeName) = 0 Then Err.Raise 5040, , "建切除基准面失败"
+    nrm = PlaneNormalZ(swModel, planeName)
+
+    ' ③ 轮廓草图
+    skName = MakeOutlineSketch(swModel, planeName, surfName, x1, y1, x2, y2)
+    If Len(skName) = 0 Then Err.Raise 5041, , "轮廓草图建立失败"
+
+    ' ④ 切除拉伸，成形到曲面。
+    '    切除默认方向 = 草图法向【反向】。法向 +Z → 默认向下 ✓；法向 -Z → 要翻转。
+    dirFlip = (nrm < 0#)
+    Call LogMsg("切除方向: 基准面法向Z=" & CStr(nrm) & "  Dir(翻转)=" & CStr(dirFlip))
+    Set feat = ExtrudeToSurface(swModel, skName, surfName, dirFlip, True)
+    If feat Is Nothing Then Err.Raise 5042, , "成形到曲面（切除）失败"
+    Call LogMsg("下模特征 = " & feat.Name)
+
+    Call ReportSolid(swModel, "下模")
+
+    Call DeleteSurfaceBodies(swModel)
+    Call SaveStep(swModel, outPath)
+    Call LogMsg("导出完成: " & outPath)
+    swApp.CloseDoc swModel.GetTitle
+End Sub
+
+
+'=====================================================================================
+' 「成形到曲面」拉伸 / 切除
+'   终止条件先试 4 = swEndCondUpToSurface，失败再试 10 = swEndCondUpToSelection
+'   （帮助里 HoleWizard5 那条 Remarks 说 10 取代了 4）
+'=====================================================================================
+Private Function ExtrudeToSurface(swModel As SldWorks.ModelDoc2, skName As String, _
+        surfName As String, dirFlip As Boolean, asCut As Boolean) As Object
+    Dim rts(0 To 1) As String
+    Dim rms(0 To 2) As Long
+    Dim ets(0 To 1) As Long
+    Dim i As Long, j As Long, k As Long
+    Dim rtCfg As String, rmCfg As String, etCfg As String
+    Dim autoRt As Boolean, autoRm As Boolean, autoEt As Boolean
+    Dim feat As Object
+
+    rts(0) = "SURFACEBODY"
+    rts(1) = "FACE"
+    rms(0) = 1
+    rms(1) = 2
+    rms(2) = 4
+    ets(0) = EC_UPTOSURFACE
+    ets(1) = EC_UPTOSELECTION
+
+    ' 只用配置指定的那一组时，组内仍然先试 T1=4 再试 T1=10
+    rtCfg = UCase$(Trim$(ReadCfg("REFTYPE", "AUTO")))
+    rmCfg = UCase$(Trim$(ReadCfg("REFMARK", "AUTO")))
+    etCfg = UCase$(Trim$(ReadCfg("ENDTYPE", "AUTO")))
+    autoRt = (rtCfg = "AUTO")
+    autoRm = (rmCfg = "AUTO")
+    autoEt = (etCfg = "AUTO")
+    Call LogMsg("  终止参考扫描: 类型=" & rtCfg & " 标记=" & rmCfg & " 终止条件=" & etCfg)
+
+    For i = 0 To 1
+        If autoRt Or rts(i) = rtCfg Then
+            For j = 0 To 2
+                If autoRm Or CStr(rms(j)) = rmCfg Then
+                    For k = 0 To 1
+                        If autoEt Or CStr(ets(k)) = etCfg Then
+                            Set feat = TryOneExtrude(swModel, skName, surfName, dirFlip, asCut, _
+                                                     rts(i), rms(j), ets(k))
+                            If Not feat Is Nothing Then
+                                Call LogMsg("  ★★ 可用的终止参考组合: " & rts(i) & _
+                                            " / mark" & CStr(rms(j)) & " / T1=" & CStr(ets(k)))
+                                Set ExtrudeToSurface = feat
+                                Exit Function
+                            End If
+                        End If
+                    Next k
+                End If
+            Next j
+        End If
+    Next i
+
+    Set ExtrudeToSurface = Nothing
+End Function
+
+
+' 试一种 (参考类型, 选择标记, 终止条件) 组合
+Private Function TryOneExtrude(swModel As SldWorks.ModelDoc2, skName As String, _
+        surfName As String, dirFlip As Boolean, asCut As Boolean, _
+        rt As String, rm As Long, endT As Long) As Object
+    Dim okS As Variant
+    Dim okF As Boolean
+    Dim feat As Object
+    Dim label As String
+
+    label = rt & "/mark" & CStr(rm) & "/T1=" & CStr(endT)
+    swModel.ClearSelection2 True
+
+    ' ★草图用 mark 0
+    okS = swModel.Extension.SelectByID2(skName, "SKETCH", 0, 0, 0, False, MK_SKETCH, Nothing, 0)
+    ' ★★终止条件参考实体用 mark 1（FeatureExtrusion3 帮助里明确写了）
+    okF = SelectEndRef(swModel, surfName, rt, rm)
+    Call LogMsg("      [" & label & "] 草图=" & CStr(okS) & " 终止参考=" & CStr(okF))
+    If Not okF Then Exit Function
+
+    Set feat = Nothing
+    On Error Resume Next
+    If asCut Then
+        Set feat = swModel.FeatureManager.FeatureCut4( _
+            True, False, dirFlip, endT, 0, 0#, 0#, _
+            False, False, False, False, 0#, 0#, _
+            False, False, False, False, False, _
+            True, True, False, False, False, _
+            ST_SKETCHPLANE, 0#, False, False)
+    Else
+        Set feat = swModel.FeatureManager.FeatureExtrusion3( _
+            True, False, dirFlip, endT, 0, 0#, 0#, _
+            False, False, False, False, 0#, 0#, _
+            False, False, False, False, _
+            True, True, True, _
+            ST_SKETCHPLANE, 0#, False)
+    End If
+    If Err.Number <> 0 Then
+        Call LogMsg("        API 抛错 " & CStr(Err.Number) & " : " & Err.Description)
+        Err.Clear
+    End If
+    On Error GoTo 0
+
+    If feat Is Nothing Then
+        Call LogMsg("        返回 Nothing")
+    Else
+        Call LogMsg("        ★ 成功 " & feat.Name)
+        Set TryOneExtrude = feat
+    End If
+End Function
+
+
+' 选终止条件参考实体
+'   SURFACEBODY = 整个曲面体（一个）
+'   FACE        = 曲面体的每个面（帮助说 start/end 条件支持 surface、face、plane）
+Private Function SelectEndRef(swModel As SldWorks.ModelDoc2, surfName As String, _
+                              rt As String, rm As Long) As Boolean
+    Dim bs As Variant
+    Dim arr As Variant
+    Dim el As Variant
+    Dim n As Long
+
+    SelectEndRef = False
+    If rt = "SURFACEBODY" Then
+        If swModel.Extension.SelectByID2(surfName, "SURFACEBODY", 0, 0, 0, True, rm, Nothing, 0) Then
+            SelectEndRef = True
+        End If
+    ElseIf rt = "FACE" Then
+        bs = swModel.GetBodies2(BT_SURFACE, True)
+        If IsEmpty(bs) Then Exit Function
+        arr = bs(0).GetFaces
+        If IsEmpty(arr) Then Exit Function
+        n = 0
+        For Each el In arr
+            On Error Resume Next
+            If el.Select2(True, rm) Then n = n + 1
+            On Error GoTo 0
+        Next el
+        Call LogMsg("        选面 " & CStr(n) & " 个 (mark=" & CStr(rm) & ")")
+        If n > 0 Then SelectEndRef = True
+    End If
+End Function
+
+
+Private Function EndTypeName(t As Long) As String
+    Select Case t
+        Case 0: EndTypeName = "盲"
+        Case 4: EndTypeName = "成形到曲面"
+        Case 7: EndTypeName = "成形到实体"
+        Case 10: EndTypeName = "成形到选定"
+        Case Else: EndTypeName = "T1=" & CStr(t)
+    End Select
+End Function
+
+
+'=====================================================================================
+' 建一个平行于【前视基准面】、位于 z = zTarget 的基准面，返回基准面名
+'   距离方向不确定 → 建完立刻读原点 z 校验，不对就带 OptionFlip(256) 重建
+'=====================================================================================
+Private Function MakePlaneAtZ(swModel As SldWorks.ModelDoc2, zTarget As Double) As String
+    Dim baseName As String
+    Dim attempt As Long
+    Dim f As Object
+    Dim oz As Double
+    Dim ok As Variant
+
+    baseName = FindZPlane(swModel)
+    MakePlaneAtZ = ""
+
+    For attempt = 0 To 1
+        swModel.ClearSelection2 True
+        ok = swModel.Extension.SelectByID2(baseName, "PLANE", 0, 0, 0, False, 0, Nothing, 0)
+        Call LogMsg("  建基准面: 选 " & baseName & " = " & CStr(ok) & _
+                    "  距离=" & CStr(Abs(zTarget)) & "m  flip=" & CStr(attempt))
+
+        Set f = Nothing
+        On Error Resume Next
+        Set f = swModel.FeatureManager.InsertRefPlane(8 + attempt * 256, Abs(zTarget), 0, 0, 0, 0)
+        If Err.Number <> 0 Then
+            Call LogMsg("    !! InsertRefPlane 抛错 " & CStr(Err.Number) & " : " & Err.Description)
+            Err.Clear
+        End If
+        On Error GoTo 0
+
+        If f Is Nothing Then
+            Call LogMsg("    !! InsertRefPlane 返回 Nothing")
+        Else
+            Call LogMsg("    新基准面 = " & f.Name)
+            oz = PlaneOriginZ(swModel, f.Name)
+            Call LogMsg("    新基准面原点 z=" & CStr(oz) & "  目标 z=" & CStr(zTarget))
+            If Abs(oz - zTarget) < 0.0001 Then
+                MakePlaneAtZ = f.Name
+                Exit Function
+            End If
+            ' 方向反了 → 删掉重建
+            Call LogMsg("    方向不对，删除后带 OptionFlip 重建")
+            swModel.ClearSelection2 True
+            ok = swModel.Extension.SelectByID2(f.Name, "PLANE", 0, 0, 0, False, 0, Nothing, 0)
+            On Error Resume Next
+            swModel.EditDelete
+            On Error GoTo 0
+        End If
+    Next attempt
+
+    Call LogMsg("!! 建基准面彻底失败")
+End Function
+
+
+'=====================================================================================
+' 在给定基准面上做形变面的投影轮廓（转换实体引用），失败回退矩形
+'=====================================================================================
+Private Function MakeOutlineSketch(swModel As SldWorks.ModelDoc2, planeName As String, _
+        surfName As String, x1 As Double, y1 As Double, x2 As Double, y2 As Double) As String
+    Dim ok As Variant
+    Dim useOutline As Boolean, innerLoops As Boolean
+    Dim inset As Double, nSeg As Long
+    Dim polyPath As String
+    Dim f As Object
+
+    useOutline = (ReadCfg("OUTLINE", "1") = "1")
+    innerLoops = (ReadCfg("INNERLOOPS", "0") = "1")
+    inset = Val(ReadCfg("INSET", "0")) / 1000#
+    polyPath = Trim$(ReadCfg("POLY", ""))
+
+    swModel.ClearSelection2 True
+    ok = swModel.Extension.SelectByID2(planeName, "PLANE", 0, 0, 0, False, 0, Nothing, 0)
+    Call LogMsg("  选基准面 " & planeName & " = " & CStr(ok))
+    swModel.SketchManager.InsertSketch True
+    Call LogMsg("  进入草图")
+
+    ' ★首选：外部算好的投影轮廓点表★
+    '   SW 自己取轮廓的两条路都不干净：
+    '     · 选【曲面体】→ SketchUseEdge3 返回 True 但生成 0 个实体
+    '     · 选【边】  → 能生成，但混进面间内部接缝 + 孔洞环，
+    '                   内部接缝让轮廓不干净，孔洞环让「成形到曲面」在洞处找不到终止面
+    '   所以轮廓由 OCC 侧算好：网格投影→栅格→内缩→取最外环→简化。
+    If Len(polyPath) > 0 Then
+        nSeg = DrawPolygonSketch(swModel, polyPath)
+    End If
+
+    If nSeg = 0 And useOutline Then
+        nSeg = ConvertSurfaceToSketch(swModel, surfName, innerLoops)
+        Call LogMsg("  转换实体引用得到草图实体数 = " & CStr(nSeg))
+    End If
+
+    If nSeg = 0 Then
+        swModel.ClearSelection2 True
+        ' ★CreateCornerRectangle 返回的是【草图实体数组】不是 Boolean★，
+        '   所以只能用语句形式调用，不能 ok = ... 赋值（CStr(数组) 会运行时报错）。
+        swModel.SketchManager.CreateCornerRectangle x1 + inset, y1 + inset, 0#, _
+                                                    x2 - inset, y2 - inset, 0#
+        Call LogMsg("  回退：包围盒矩形 inset=" & CStr(inset * 1000#) & "mm")
+        nSeg = CountSketchSegments(swModel)
+        Call LogMsg("  回退后草图实体数 = " & CStr(nSeg))
+    End If
+
+    swModel.ClearSelection2 True
+    swModel.SketchManager.InsertSketch True
+    Call LogMsg("  退出草图")
+
+    Set f = swModel.FeatureByPositionReverse(0)
+    If f Is Nothing Then
+        MakeOutlineSketch = ""
+    Else
+        MakeOutlineSketch = f.Name
+        Call LogMsg("  草图特征 = " & MakeOutlineSketch & " type=" & f.GetTypeName2)
+    End If
+End Function
+
+
+'=====================================================================================
+' 读外部点表，在草图里画成闭合多边形
+'   文件格式（纯 ASCII）：
+'       第1行 = 点数 N
+'       其后 N 行 = "x y"  （单位 mm，世界 XY，与草图坐标一致）
+'   草图坐标 = 世界 XY（已由旧版矩形定位验证过），所以直接用。
+'=====================================================================================
+Private Function DrawPolygonSketch(swModel As SldWorks.ModelDoc2, polyPath As String) As Long
+    Dim f As Integer
+    Dim n As Long, i As Long, cnt As Long
+    Dim xs() As Double, ys() As Double
+    Dim dx0 As Double, dy0 As Double
+
+    DrawPolygonSketch = 0
+    If Dir(polyPath) = "" Then
+        Call LogMsg("    !! 轮廓点表不存在: " & polyPath)
+        Exit Function
+    End If
+    n = 0
+    On Error Resume Next
+    f = FreeFile
+    Open polyPath For Input As #f
+    Input #f, n
+    Call LogMsg("    轮廓点数 = " & CStr(n))
+    If Err.Number <> 0 Or n < 3 Then
+        Call LogMsg("    !! 读点数失败 n=" & CStr(n))
+        Close #f
+        Err.Clear
+        On Error GoTo 0
+        Exit Function
+    End If
+    ReDim xs(1 To n)
+    ReDim ys(1 To n)
+    For i = 1 To n
+        Input #f, xs(i), ys(i)
+    Next i
+    Close #f
+    If Err.Number <> 0 Then
+        Call LogMsg("    !! 读点失败: " & Err.Description)
+        Err.Clear
+        On Error GoTo 0
+        Exit Function
+    End If
+    On Error GoTo 0
+
+    ' ★去掉重复的收尾点★
+    '   外部轮廓点表常常首尾点重合（matplotlib 的 contour 就是这样）。
+    '   若原样画线，会多出一条 "点n -> 点1" 的【零长度线段】，
+    '   草图轮廓随即失效，FeatureExtrusion3 直接返回 Nothing。
+    '   —— 这一个坑就让「成形到曲面」白白失败了整整一轮。
+    If n >= 2 Then
+        dx0 = xs(n) - xs(1)
+        dy0 = ys(n) - ys(1)
+        If Sqr(dx0 * dx0 + dy0 * dy0) < 0.000001 Then
+            Call LogMsg("    收尾点与首点重合，按 " & CStr(n - 1) & " 点处理")
+            n = n - 1
+        End If
+    End If
+    If n < 3 Then
+        Call LogMsg("    !! 有效点数不足 (" & CStr(n) & ")")
+        Exit Function
+    End If
+
+    cnt = 0
+    For i = 1 To n - 1
+        swModel.SketchManager.CreateLine xs(i) / 1000#, ys(i) / 1000#, 0#, _
+                                         xs(i + 1) / 1000#, ys(i + 1) / 1000#, 0#
+        cnt = cnt + 1
+    Next i
+    swModel.SketchManager.CreateLine xs(n) / 1000#, ys(n) / 1000#, 0#, _
+                                     xs(1) / 1000#, ys(1) / 1000#, 0#
+    cnt = cnt + 1
+    Call LogMsg("    画了 " & CStr(cnt) & " 条线（闭合，" & CStr(n) & " 个顶点）")
+    DrawPolygonSketch = cnt
+End Function
+
+
+'=====================================================================================
+' 把形变面转成草图实体（转换实体引用）
+'   ★实测：对【曲面体】调用 SketchUseEdge3 返回 True 却一个实体都不生成★
+'     （日志：SketchUseEdge3 = True，草图实体数 = 0）
+'   所以依次尝试三种选中方式，哪种真的产出实体就用哪种：
+'     BODY = 选整个曲面体
+'     FACE = 逐个选曲面体的面（官方 Convert Entities 示例用的就是选面）
+'     EDGE = 逐个选曲面体的边
+'=====================================================================================
+Private Function ConvertSurfaceToSketch(swModel As SldWorks.ModelDoc2, surfName As String, _
+                                        innerLoops As Boolean) As Long
+    Dim modes(0 To 2) As String
+    Dim i As Long, n As Long, nSeg As Long
+    Dim bs As Variant, arr As Variant
+    Dim el As Variant
+    Dim okc As Variant, okb As Variant
+    Dim forced As String
+
+    modes(0) = "BODY"
+    modes(1) = "FACE"
+    modes(2) = "EDGE"
+    forced = UCase$(Trim$(ReadCfg("SELMODE", "AUTO")))
+
+    For i = 0 To 2
+        If forced <> "AUTO" And forced <> modes(i) Then GoTo NextMode
+
+        swModel.ClearSelection2 True
+        n = 0
+        If modes(i) = "BODY" Then
+            okb = swModel.Extension.SelectByID2(surfName, "SURFACEBODY", 0, 0, 0, False, 0, Nothing, 0)
+            If okb Then n = 1
+        Else
+            bs = swModel.GetBodies2(BT_SURFACE, True)
+            If Not IsEmpty(bs) Then
+                If modes(i) = "FACE" Then
+                    arr = bs(0).GetFaces
+                Else
+                    arr = bs(0).GetEdges
+                End If
+                If Not IsEmpty(arr) Then
+                    For Each el In arr
+                        On Error Resume Next
+                        If el.Select2(True, 0) Then n = n + 1
+                        On Error GoTo 0
+                    Next el
+                End If
+            End If
+        End If
+        Call LogMsg("    轮廓来源 " & modes(i) & "：选中 " & CStr(n) & " 个")
+        If n > 0 Then
+            okc = False
+            On Error Resume Next
+            okc = swModel.SketchManager.SketchUseEdge3(False, innerLoops)
+            If Err.Number <> 0 Then
+                Call LogMsg("      !! SketchUseEdge3 抛错 " & CStr(Err.Number) & " : " & Err.Description)
+                Err.Clear
+                okc = False
+            End If
+            On Error GoTo 0
+            nSeg = CountSketchSegments(swModel)
+            Call LogMsg("      SketchUseEdge3=" & CStr(okc) & "  草图实体数=" & CStr(nSeg))
+            If nSeg > 0 Then
+                Call LogMsg("    ★ 轮廓来源确定为 " & modes(i))
+                ConvertSurfaceToSketch = nSeg
+                Exit Function
+            End If
+        End If
+NextMode:
+    Next i
+
+    ConvertSurfaceToSketch = 0
+End Function
+
+
+'=====================================================================================
+' 双向盲拉伸做长方体（旧版已验证可行的定位技巧：
+'   在前视基准面上画矩形，Sd=False，D1 向 +Z、D2 向 -Z）
+'=====================================================================================
+Private Sub BossBlind(swModel As SldWorks.ModelDoc2, planeName As String, _
+        px1 As Double, py1 As Double, px2 As Double, py2 As Double, _
+        upM As Double, dnM As Double)
+    Dim ok As Variant
+    Dim feat As Object
+
+    swModel.ClearSelection2 True
+    ok = swModel.Extension.SelectByID2(planeName, "PLANE", 0, 0, 0, False, 0, Nothing, 0)
+    Call LogMsg("  基座草图: 选 " & planeName & " = " & CStr(ok))
+    swModel.SketchManager.InsertSketch True
+    swModel.SketchManager.CreateCornerRectangle px1, py1, 0#, px2, py2, 0#
+    swModel.SketchManager.InsertSketch True
+    Call LogMsg("  基座矩形: x[" & CStr(px1) & "," & CStr(px2) & "] y[" & CStr(py1) & "," & CStr(py2) & "]")
+
+    If dnM > 0# Then
+        Set feat = swModel.FeatureManager.FeatureExtrusion3( _
+            False, False, False, EC_BLIND, 0, upM, dnM, _
+            False, False, False, False, 0#, 0#, _
+            False, False, False, False, True, True, True, _
+            ST_SKETCHPLANE, 0#, False)
+    Else
+        Set feat = swModel.FeatureManager.FeatureExtrusion3( _
+            True, False, False, EC_BLIND, 0, upM, 0#, _
+            False, False, False, False, 0#, 0#, _
+            False, False, False, False, True, True, True, _
+            ST_SKETCHPLANE, 0#, False)
+    End If
+    If feat Is Nothing Then Err.Raise 5050, , "基座拉伸失败"
+    Call LogMsg("  基座拉伸 OK = " & feat.Name)
+End Sub
+
+
+'=====================================================================================
+' 基础工具
+'=====================================================================================
+Private Function LoadStep(swApp As SldWorks.SldWorks, path As String) As SldWorks.ModelDoc2
+    Dim errs As Long
+    Dim m As SldWorks.ModelDoc2
+    ' ★必须先关掉残留的同名文档★
+    '   上一轮如果中途报错，文档会留在 SW 里没关；下次 LoadFile4 会直接返回那个
+    '   已损坏/已回滚的文档（实测：日志直接报"文档里没有体"）。
+    Call CloseStaleDoc(swApp, path)
+    Set m = swApp.LoadFile4(path, "r", Nothing, errs)
+    Call LogMsg("LoadFile4 errors=" & CStr(errs))
+    If m Is Nothing Then Err.Raise 5002, , "LoadFile4 失败: " & path & " errors=" & CStr(errs)
+    Set LoadStep = m
+End Function
+
+
+' 关掉所有与 srcPath 同名的已打开文档
+Private Sub CloseStaleDoc(swApp As SldWorks.SldWorks, srcPath As String)
+    Dim docs As Variant
+    Dim d As Variant
+    Dim want As String
+    Dim i As Long
+    want = BaseNameNoExt(srcPath)
+    On Error Resume Next
+    docs = swApp.GetDocuments
+    If Not IsEmpty(docs) Then
+        For i = LBound(docs) To UBound(docs)
+            Set d = docs(i)
+            If Not d Is Nothing Then
+                If StrComp(BaseNameNoExt(d.GetTitle), want, vbTextCompare) = 0 Then
+                    Call LogMsg("关闭残留文档: " & d.GetTitle)
+                    swApp.CloseDoc d.GetTitle
+                End If
+            End If
+        Next i
+    End If
+    On Error GoTo 0
+End Sub
+
+
+' 取文件名（去目录去扩展名）
+Private Function BaseNameNoExt(p As String) As String
+    Dim s As String
+    Dim i As Long
+    s = p
+    i = InStrRev(s, "\")
+    If i > 0 Then s = Mid$(s, i + 1)
+    i = InStrRev(s, "/")
+    If i > 0 Then s = Mid$(s, i + 1)
+    i = InStrRev(s, ".")
+    If i > 1 Then s = Left$(s, i - 1)
+    BaseNameNoExt = s
+End Function
+
+
+Private Sub BodyBox(swModel As SldWorks.ModelDoc2, ByRef x1 As Double, ByRef y1 As Double, _
+                    ByRef z1 As Double, ByRef x2 As Double, ByRef y2 As Double, ByRef z2 As Double)
+    Dim bs As Variant
+    Dim v As Variant
+    bs = swModel.GetBodies2(-1, True)
+    If IsEmpty(bs) Then Err.Raise 5003, , "文档里没有体"
+    v = bs(0).GetBodyBox
+    x1 = v(0): y1 = v(1): z1 = v(2)
+    x2 = v(3): y2 = v(4): z2 = v(5)
+End Sub
+
+
+Private Function FirstSurfaceName(swModel As SldWorks.ModelDoc2) As String
+    Dim bs As Variant
+    Dim n As Long
+    bs = swModel.GetBodies2(BT_SURFACE, True)
+    If IsEmpty(bs) Then Err.Raise 5021, , "文档里没有曲面体"
+    n = UBound(bs) - LBound(bs) + 1
+    FirstSurfaceName = bs(0).Name
+    Call LogMsg("曲面体: " & FirstSurfaceName & "  (共 " & CStr(n) & " 个)")
+End Function
+
+
+Private Sub DeleteSurfaceBodies(swModel As SldWorks.ModelDoc2)
+    ' ★这一步很重要★
+    '   SW 的 STEP 导出是【整个文档】导。只要文档里还留着一个曲面体，
+    '   导出的 STEP 就会是 SHELL_BASED_SURFACE_MODEL（闭合壳 + 开放壳各一个），
+    '   别的软件读回来 = 0 个实体，后续装配/干涉检查全部失效。
+    '   实测 EditDelete 一次不一定删得掉，所以这里多级重试并【复查】。
+    Dim bs As Variant
+    Dim s As Variant
+    Dim ok As Variant
+    Dim n As Long
+    Dim attempt As Long
+    Dim nLeft As Long
+
+    For attempt = 0 To 2
+        bs = swModel.GetBodies2(BT_SURFACE, True)
+        If IsEmpty(bs) Then
+            If attempt > 0 Then Call LogMsg("  残留曲面体已清空")
+            Exit Sub
+        End If
+        nLeft = UBound(bs) - LBound(bs) + 1
+        swModel.ClearSelection2 True
+        n = 0
+        For Each s In bs
+            ok = swModel.Extension.SelectByID2(s.Name, "SURFACEBODY", 0, 0, 0, True, 0, Nothing, 0)
+            If ok Then n = n + 1
+        Next s
+        Call LogMsg("  删除残留曲面体 第" & CStr(attempt + 1) & "次: 选中 " & CStr(n) & _
+                    " / 共 " & CStr(nLeft) & " 个")
+        If n = 0 Then Exit Sub
+        On Error Resume Next
+        swModel.EditDelete
+        If Err.Number <> 0 Then
+            Call LogMsg("    EditDelete 抛错 " & CStr(Err.Number))
+            Err.Clear
+        End If
+        ' 备用：DeleteSelection2（比 EditDelete 更直接）
+        If Not swModel.GetBodies2(BT_SURFACE, True) Is Nothing Then
+            swModel.Extension.DeleteSelection2 0
+        End If
+        On Error GoTo 0
+    Next attempt
+
+    bs = swModel.GetBodies2(BT_SURFACE, True)
+    If IsEmpty(bs) Then
+        Call LogMsg("  残留曲面体已清空")
+    Else
+        Call LogMsg("  !! 仍有 " & CStr(UBound(bs) - LBound(bs) + 1) & _
+                    " 个曲面体没删掉 —— 导出的 STEP 会是曲面模型，需要外部后处理归一化")
+    End If
+End Sub
+
+
+Private Sub ReportSolid(swModel As SldWorks.ModelDoc2, tag As String)
+    Dim bs As Variant
+    Dim v As Variant
+    Dim mp As Variant
+    Dim n As Long
+    bs = swModel.GetBodies2(BT_SOLID, True)
+    If IsEmpty(bs) Then
+        Call LogMsg("!! " & tag & " 没有实体！")
+        Exit Sub
+    End If
+    n = UBound(bs) - LBound(bs) + 1
+    v = bs(0).GetBodyBox
+    mp = bs(0).GetMassProperties(0)
+    Call LogMsg(tag & " 实体数=" & CStr(n) & "  体积=" & CStr(mp(3)))
+    Call LogMsg(tag & " bbox x=[" & CStr(v(0)) & "," & CStr(v(3)) & _
+                "] y=[" & CStr(v(1)) & "," & CStr(v(4)) & _
+                "] z=[" & CStr(v(2)) & "," & CStr(v(5)) & "]")
+End Sub
+
+
+' 找法向为 Z 的基准面名（找不到回退"前视基准面"）
+Private Function FindZPlane(swModel As SldWorks.ModelDoc2) As String
+    Dim swFeat As Object
+    Dim swRef As Object
+    Dim xf As Object
+    Dim d As Variant
+    Dim bestName As String
+    Dim cnt As Long
+    bestName = ""
+    cnt = 0
+    On Error Resume Next
+    Set swFeat = swModel.FirstFeature
+    Do While Not swFeat Is Nothing
+        If swFeat.GetTypeName2 = "RefPlane" Then
+            cnt = cnt + 1
+            Set swRef = swFeat.GetSpecificFeature2
+            Set xf = swRef.Transform
+            d = xf.ArrayData
+            If IsArray(d) Then
+                If Abs(d(6)) < 0.000001 And Abs(d(7)) < 0.000001 Then
+                    If Abs(Abs(d(8)) - 1#) < 0.000001 Then bestName = swFeat.Name
+                End If
+            End If
+        End If
+        Set swFeat = swFeat.GetNextFeature
+    Loop
+    On Error GoTo 0
+    Call LogMsg("  RefPlane 共 " & CStr(cnt) & " 个，Z 法向的 = " & bestName)
+    If Len(bestName) = 0 Then bestName = "前视基准面"
+    FindZPlane = bestName
+End Function
+
+
+' 取某个基准面的法向 Z 分量 + 原点 Z
+Private Function PlaneDataZ(swModel As SldWorks.ModelDoc2, planeName As String, _
+                            ByRef normalZ As Double, ByRef originZ As Double) As Boolean
+    Dim swFeat As Object
+    Dim swRef As Object
+    Dim xf As Object
+    Dim d As Variant
+    normalZ = 0#: originZ = 0#
+    On Error Resume Next
+    Set swFeat = swModel.FirstFeature
+    Do While Not swFeat Is Nothing
+        If swFeat.GetTypeName2 = "RefPlane" And swFeat.Name = planeName Then
+            Set swRef = swFeat.GetSpecificFeature2
+            Set xf = swRef.Transform
+            d = xf.ArrayData
+            If IsArray(d) Then
+                normalZ = d(8)
+                originZ = d(11)
+                PlaneDataZ = True
+            End If
+            Exit Do
+        End If
+        Set swFeat = swFeat.GetNextFeature
+    Loop
+    On Error GoTo 0
+End Function
+
+
+Private Function PlaneNormalZ(swModel As SldWorks.ModelDoc2, planeName As String) As Double
+    Dim nz As Double, oz As Double
+    Call PlaneDataZ(swModel, planeName, nz, oz)
+    PlaneNormalZ = nz
+End Function
+
+
+Private Function PlaneOriginZ(swModel As SldWorks.ModelDoc2, planeName As String) As Double
+    Dim nz As Double, oz As Double
+    Call PlaneDataZ(swModel, planeName, nz, oz)
+    PlaneOriginZ = oz
+End Function
+
+
+' 当前打开草图里的实体数
+Private Function CountSketchSegments(swModel As SldWorks.ModelDoc2) As Long
+    Dim sk As Object
+    Dim arr As Variant
+    CountSketchSegments = 0
+    On Error Resume Next
+    Set sk = swModel.GetActiveSketch2
+    If sk Is Nothing Then Exit Function
+    arr = sk.GetSketchSegments
+    If Not IsEmpty(arr) Then
+        If IsArray(arr) Then CountSketchSegments = UBound(arr) - LBound(arr) + 1
+    End If
+    On Error GoTo 0
+End Function
+
+
+Private Sub SaveStep(swModel As SldWorks.ModelDoc2, path As String)
+    Dim errs As Long, warns As Long
+    swModel.Extension.SaveAs path, 0, 1, Nothing, errs, warns
+    Call LogMsg("SaveAs errors=" & CStr(errs) & " warns=" & CStr(warns))
+    If Dir(path) = "" Then Err.Raise 5010, , "导出 STEP 失败: " & path
+End Sub
+
+
+'=====================================================================================
+' 配置 / 结果
+'=====================================================================================
+Private Function CfgPath() As String
+    CfgPath = Environ$("TEMP") & "\" & CFG_NAME
+End Function
+
+Private Function ResPath() As String
+    ResPath = Environ$("TEMP") & "\" & RES_NAME
+End Function
+
+Public Function ReadCfg(key As String, dflt As String) As String
+    Dim f As Integer, ln As String, p As Long
+    ReadCfg = dflt
+    If Dir(CfgPath()) = "" Then Exit Function
+    f = FreeFile
+    Open CfgPath() For Input As #f
+    Do While Not EOF(f)
+        Line Input #f, ln
+        ln = Trim$(ln)
+        If Len(ln) > 0 And Left$(ln, 1) <> "#" Then
+            p = InStr(ln, "=")
+            If p > 0 Then
+                If UCase$(Trim$(Left$(ln, p - 1))) = UCase$(key) Then
+                    ReadCfg = Trim$(Mid$(ln, p + 1))
+                    Exit Do
+                End If
+            End If
+        End If
+    Loop
+    Close #f
+End Function
+
+Private Sub WriteRes(s As String)
+    Dim f As Integer
+    f = FreeFile
+    Open ResPath() For Output As #f
+    Print #f, s
+    Close #f
+End Sub
